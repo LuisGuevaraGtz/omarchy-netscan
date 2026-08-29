@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+import json
+import re
+import socket
+import shutil
+
+def get_network_details():
+    iface = ""
+    gateway = ""
+    subnet = ""
+    local_ip = ""
+    
+    try:
+        route_proc = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=2)
+        for line in route_proc.stdout.splitlines():
+            if line.startswith("default"):
+                parts = line.split()
+                if "via" in parts:
+                    gateway = parts[parts.index("via") + 1]
+                if "dev" in parts:
+                    iface = parts[parts.index("dev") + 1]
+            elif "src" in line and iface and f"dev {iface}" in line:
+                parts = line.split()
+                if not subnet:
+                    subnet = parts[0]
+                if "src" in parts:
+                    local_ip = parts[parts.index("src") + 1]
+    except Exception as e:
+        pass
+
+    return iface, gateway, subnet, local_ip
+
+def classify_device(ip, mac, vendor, gateway, local_ip):
+    v_lower = vendor.lower()
+    is_gw = (ip == gateway)
+    is_self = (ip == local_ip)
+    
+    if is_gw:
+        return "󰒋", "Router / Gateway", True, False
+    if is_self:
+        return "󰍹", "This Device", False, True
+    
+    # Phone / Tablet
+    if any(k in v_lower for k in ["apple", "samsung", "xiaomi", "pixel", "oneplus", "motorola", "huawei phone", "oppo", "vivo"]):
+        return "󰄡", "Phone / Mobile", False, False
+    
+    # Smart device / IoT / Camera
+    if any(k in v_lower for k in ["wyze", "amazon", "tuya", "sonoff", "nest", "roku", "espressif", "ring", "philips", "tp-link", "shelly"]):
+        return "󰛳", "Smart IoT Device", False, False
+    
+    # PC / Laptop
+    if any(k in v_lower for k in ["intel", "dell", "hp", "lenovo", "asus", "gigabyte", "msi", "realtek", "asrock", "micro-star", "framework"]):
+        return "󰌢", "Computer / Laptop", False, False
+    
+    # Generic Network / Other
+    return "󰛳", "Network Host", False, False
+
+def scan_network():
+    iface, gateway, subnet, local_ip = get_network_details()
+    devices_dict = {}
+
+    # 1. Try arp-scan first (fastest and gives MAC vendor)
+    arp_scan_bin = shutil.which("arp-scan")
+    if arp_scan_bin:
+        try:
+            cmd = [arp_scan_bin, "--localnet"]
+            if iface:
+                cmd.extend(["--interface", iface])
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                match = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)$", line)
+                if match:
+                    ip, mac, vendor = match.groups()
+                    vendor = vendor.strip()
+                    if vendor == "(Unknown: locally administered)":
+                        vendor = "Locally Administered"
+                    elif vendor == "(Unknown)":
+                        vendor = "Unknown Vendor"
+                    
+                    icon, category, is_gw, is_self = classify_device(ip, mac, vendor, gateway, local_ip)
+                    devices_dict[ip] = {
+                        "ip": ip,
+                        "mac": mac.lower(),
+                        "vendor": vendor,
+                        "icon": icon,
+                        "category": category,
+                        "isGateway": is_gw,
+                        "isSelf": is_self
+                    }
+        except Exception:
+            pass
+
+    # 2. Add local host if not present
+    if local_ip and local_ip not in devices_dict:
+        icon, category, is_gw, is_self = classify_device(local_ip, "", "Local Host", gateway, local_ip)
+        devices_dict[local_ip] = {
+            "ip": local_ip,
+            "mac": "(local)",
+            "vendor": "This Computer",
+            "icon": "󰍹",
+            "category": "This Device",
+            "isGateway": False,
+            "isSelf": True
+        }
+
+    # 3. Complement with `ip neigh show`
+    try:
+        neigh_proc = subprocess.run(["ip", "-4", "neigh", "show"], capture_output=True, text=True, timeout=2)
+        for line in neigh_proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and "lladdr" in parts:
+                ip = parts[0]
+                mac = parts[parts.index("lladdr") + 1].lower()
+                state = parts[-1]
+                if state in ["REACHABLE", "STALE", "DELAY", "PROBE"] and ip not in devices_dict:
+                    icon, category, is_gw, is_self = classify_device(ip, mac, "Unknown Host", gateway, local_ip)
+                    devices_dict[ip] = {
+                        "ip": ip,
+                        "mac": mac,
+                        "vendor": "Network Device",
+                        "icon": icon,
+                        "category": category,
+                        "isGateway": is_gw,
+                        "isSelf": is_self
+                    }
+    except Exception:
+        pass
+
+    # Sort devices: Gateway first, then This PC, then by IPv4 numerical address
+    def sort_key(d):
+        if d["isGateway"]:
+            return (0, 0, 0, 0, 0)
+        if d["isSelf"]:
+            return (1, 0, 0, 0, 0)
+        try:
+            octets = [int(x) for x in d["ip"].split(".")]
+            return (2, *octets)
+        except Exception:
+            return (3, 0, 0, 0, 0)
+
+    devices_list = sorted(devices_dict.values(), key=sort_key)
+
+    output = {
+        "status": "ok",
+        "iface": iface or "unknown",
+        "gateway": gateway or "unknown",
+        "subnet": subnet or "unknown",
+        "localIp": local_ip or "unknown",
+        "deviceCount": len(devices_list),
+        "devices": devices_list
+    }
+    print(json.dumps(output))
+
+def scan_ports(target_ip):
+    if not target_ip or not re.match(r"^\d+\.\d+\.\d+\.\d+$", target_ip):
+        print(json.dumps({"status": "error", "message": "Invalid target IP"}))
+        return
+
+    nmap_bin = shutil.which("nmap")
+    if not nmap_bin:
+        print(json.dumps({"status": "error", "message": "nmap binary not found"}))
+        return
+
+    ports = []
+    latency = ""
+    host_up = False
+
+    try:
+        # Fast top ports scan
+        cmd = [nmap_bin, "-Pn", "-F", "--open", "-T4", "--max-retries", "1", "--host-timeout", "4s", target_ip]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        
+        open_port_numbers = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if "Host is up" in line:
+                host_up = True
+                m = re.search(r"\(([\d\.]+s) latency\)", line)
+                if m:
+                    latency = m.group(1)
+            
+            m_port = re.match(r"^(\d+)/(\w+)\s+(\w+)\s+(\S+)(?:\s+(.*))?$", line)
+            if m_port:
+                port_num, proto, state, service, ver = m_port.groups()
+                if state.lower() == "open":
+                    open_port_numbers.append(port_num)
+                    ports.append({
+                        "port": f"{port_num}/{proto}",
+                        "portNum": int(port_num),
+                        "protocol": proto,
+                        "state": state,
+                        "service": service,
+                        "version": ver or ""
+                    })
+
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e)}))
+        return
+
+    print(json.dumps({
+        "status": "ok",
+        "ip": target_ip,
+        "hostUp": host_up or len(ports) > 0,
+        "latency": latency or "< 1ms",
+        "portCount": len(ports),
+        "ports": ports
+    }))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] == "scan":
+        scan_network()
+    elif sys.argv[1] == "ports":
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
+        scan_ports(target)
+    else:
+        print(json.dumps({"status": "error", "message": "Unknown command"}))

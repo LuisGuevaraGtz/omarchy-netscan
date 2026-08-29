@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "lu15ggtz.netscan",
+  "name": "Network Scanner",
+  "version": "1.0.0",
+  "author": "Luis Adolfo Guevara Gutierrez (lu15ggtz)",
+  "description": "Fast local network discovery via arp-scan with on-demand nmap service inspection for Omarchy",
+  "homepage": "https://github.com/lu15ggtz/omarchy-netscan",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Network Scanner",
+    "description": "Scan and inspect devices and open ports on your local Wi-Fi / LAN network",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelWidth": 430
+    }
+  }
+}
