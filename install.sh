@@ -27,14 +27,34 @@ if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
   exit 1
 fi
 
-# Ensure arp-scan has raw packet capabilities (or run with sudo if needed)
-if command -v setcap &>/dev/null && command -v arp-scan &>/dev/null; then
-  ARP_SCAN_PATH=$(which arp-scan)
-  if ! getcap "$ARP_SCAN_PATH" | grep -q "cap_net_raw"; then
-    echo "[*] Setting capabilities on arp-scan for unprivileged scanning..."
-    sudo setcap cap_net_raw+p "$ARP_SCAN_PATH" 2>/dev/null || true
+# Optional: grant arp-scan raw packet capabilities for unprivileged scanning.
+# This modifies a system-wide binary, so it is opt-in and requires explicit
+# confirmation. If skipped, the plugin will fall back to running arp-scan with
+# whatever privileges are available (and README documents an alternative).
+try_setcap_arpscan() {
+  if ! command -v setcap &>/dev/null || ! command -v arp-scan &>/dev/null; then
+    return
   fi
-fi
+  ARP_SCAN_PATH=$(which arp-scan)
+  if getcap "$ARP_SCAN_PATH" 2>/dev/null | grep -q "cap_net_raw"; then
+    echo "[*] arp-scan already has cap_net_raw."
+    return
+  fi
+
+  read -r -p "[?] Grant cap_net_raw to arp-scan for unprivileged scanning? [y/N] " ans
+  case "$ans" in
+    [yY]|[yY][eE][sS])
+      echo "[*] Setting capabilities on arp-scan for unprivileged scanning..."
+      sudo setcap cap_net_raw+p "$ARP_SCAN_PATH" || \
+        echo "[!] Unable to set cap_net_raw (you may need to run arp-scan with sudo instead)."
+      ;;
+    *)
+      echo "[*] Skipping cap_net_raw setup. arp-scan may require sudo to scan."
+      ;;
+  esac
+}
+
+try_setcap_arpscan
 
 # 2. Create plugin destination directory
 mkdir -p "$PLUGIN_DIR"

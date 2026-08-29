@@ -20,36 +20,13 @@ Designed to complement the Omarchy Wi-Fi menu, this plugin lives right on your t
 
 ## 📸 Preview
 
-```text
-+-------------------------------------------------------------+
-|  󰛳  Local Network                                   󰚌     |
-|     6 DEVICES ONLINE · 192.168.100.0/24                     |
-+-------------------------------------------------------------+
-|  iface: wlp1s0  ·  gw: 192.168.100.1                        |
-+-------------------------------------------------------------+
-|  Discovered Hosts (arp-scan)                                |
-|                                                             |
-|  󰒋  192.168.100.1 [GW]                           󰅀         |
-|     HUAWEI TECHNOLOGIES CO.,LTD                             |
-|                                                             |
-|  󰍹  192.168.100.43 [YOU]                         󰅂         |
-|     This Computer                                           |
-|                                                             |
-|  󰛳  192.168.100.23                               󰅂         |
-|     Wyze Labs Inc                                           |
-+-------------------------------------------------------------+
-|  [Details & Port Scan]                                      |
-|  192.168.100.1 [GW]                   [Copy] [Scan (Nmap)]  |
-|  MAC: e4:77:27:60:64:ac · Router / Gateway                  |
-|  Vendor: HUAWEI TECHNOLOGIES CO.,LTD                        |
-|  ---------------------------------------------------------  |
-|  OPEN PORTS (3) · 0.012s                                    |
-|  53/tcp    domain                                           |
-|  80/tcp    http                                         󰖟   |
-+-------------------------------------------------------------+
-|  j/k: navigate · s: scan ports · r: refresh · esc: close   |
-+-------------------------------------------------------------+
-```
+The Network Scanner widget lives right on your Omarchy top bar and opens a native, dark-themed popup:
+
+![Network Scanner plugin popup](screenshots/omarchy-netscan-plugin-only.png)
+
+*For a full desktop context:*
+
+![Network Scanner on the full desktop](screenshots/omarchy-netscan-full-screen.png)
 
 ---
 
@@ -61,10 +38,11 @@ The plugin relies on standard, unprivileged network utilities available in Arch 
 sudo pacman -S arp-scan nmap python
 ```
 
-> **Note**: To allow `arp-scan` to perform raw socket scanning without prompting for `sudo`, grant it the `cap_net_raw` capability:
+> **Note**: To allow `arp-scan` to perform raw socket scanning without prompting for `sudo`, you may grant it the `cap_net_raw` capability (optional):
 > ```bash
 > sudo setcap cap_net_raw+p $(which arp-scan)
 > ```
+> `install.sh` will ask for your explicit confirmation before modifying this system-wide binary. If you decline, the plugin still works — `arp-scan` will simply run with standard privileges (you may need to run it under `sudo` instead).
 
 ---
 
