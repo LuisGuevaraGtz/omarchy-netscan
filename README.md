@@ -51,14 +51,14 @@ sudo pacman -S arp-scan nmap python
 ### Method 1: Using Omarchy CLI (Recommended)
 
 ```bash
-omarchy plugin add https://github.com/lu15ggtz/omarchy-netscan.git
+omarchy plugin add https://github.com/LuisGuevaraGtz/omarchy-netscan.git
 ```
 
 ### Method 2: Manual Installation
 
 1. Clone this repository into your Omarchy plugins folder:
 ```bash
-git clone https://github.com/lu15ggtz/omarchy-netscan.git ~/.config/omarchy/plugins/lu15ggtz.netscan
+git clone https://github.com/LuisGuevaraGtz/omarchy-netscan.git ~/.config/omarchy/plugins/lu15ggtz.netscan
 ```
 
 2. Run the automated setup script:
@@ -129,7 +129,7 @@ omarchy-netscan --ports 192.168.100.1
 
 This repository contains a valid `manifest.json` adhering to `schemaVersion: 1`. To submit and publish this plugin to the community directory at [omarchyplugins.com](https://omarchyplugins.com):
 
-1. Push your repository to GitHub: `https://github.com/lu15ggtz/omarchy-netscan`.
+1. Push your repository to GitHub: `https://github.com/LuisGuevaraGtz/omarchy-netscan`.
 2. Visit [omarchyplugins.com](https://omarchyplugins.com) and submit your repository URL, or submit a pull request to the Omarchy Plugins directory index repository.
 3. The catalog will automatically parse `manifest.json`, the description, and the `bar-widget` entry points.
 
@@ -139,4 +139,4 @@ This repository contains a valid `manifest.json` adhering to `schemaVersion: 1`.
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for more information.
 
-Author: **Luis Adolfo Guevara Gutierrez** ([@lu15ggtz](https://github.com/lu15ggtz))
+Author: **Luis Adolfo Guevara Gutierrez** ([@LuisGuevaraGtz](https://github.com/LuisGuevaraGtz))
