@@ -105,11 +105,19 @@ fi
 EOF
 chmod +x "$HOME/.local/bin/omarchy-netscan"
 
-# 5. Enable in shell.json if not already present
+# 5. Optionally enable in shell.json (only with explicit user consent).
+# We never modify the user's bar configuration without confirmation.
 if [ -f "$SHELL_CONFIG" ]; then
   if ! grep -q "$PLUGIN_ID" "$SHELL_CONFIG"; then
-    echo "[*] Adding widget to $SHELL_CONFIG..."
-    python3 -c "
+    read -r -p "[?] Add Network Scanner to your Omarchy bar ($SHELL_CONFIG)? [Y/n] " ans
+    case "$ans" in
+      [nN]|[nN][oO])
+        echo "[*] Skipping shell.json changes. You can add it later via"
+        echo "    omarchy plugin enable lu15ggtz.netscan or by editing $SHELL_CONFIG manually."
+        ;;
+      *)
+        echo "[*] Adding widget to $SHELL_CONFIG..."
+        python3 -c "
 import json
 with open('$SHELL_CONFIG', 'r') as f:
     data = json.load(f)
@@ -128,7 +136,14 @@ if not any(item.get('id') == '$PLUGIN_ID' for item in right_layout):
     with open('$SHELL_CONFIG', 'w') as f:
         json.dump(data, f, indent=2)
 "
+        ;;
+    esac
   fi
 fi
 
-echo "==> Installation complete! The Network Scanner icon is now available on your Omarchy bar."
+echo "==> Installation complete!"
+if grep -q "$PLUGIN_ID" "$SHELL_CONFIG" 2>/dev/null; then
+  echo "    The Network Scanner icon is now available on your Omarchy bar."
+else
+  echo "    Enable it later on your bar with:  omarchy plugin enable lu15ggtz.netscan"
+fi

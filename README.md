@@ -82,7 +82,15 @@ cd ~/.config/omarchy/plugins/lu15ggtz.netscan
 }
 ```
 
-Omarchy's shell will detect the new plugin and render the `󰛳` icon on your top bar automatically.
+The installer will ask for your explicit confirmation before adding the widget
+to `~/.config/omarchy/shell.json`. If you decline, the plugin is installed but
+not shown on your bar; enable it later with:
+
+```bash
+omarchy plugin enable lu15ggtz.netscan
+```
+
+Once enabled, Omarchy's shell detects the plugin and renders the `󰛳` icon on your top bar.
 
 ---
 
