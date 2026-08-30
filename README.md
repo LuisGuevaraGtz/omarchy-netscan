@@ -86,6 +86,25 @@ Omarchy's shell will detect the new plugin and render the `󰛳` icon on your to
 
 ---
 
+## 🗑️ Uninstall
+
+To fully remove the plugin (plugin files, CLI wrapper, and bar widget entry):
+
+```bash
+./uninstall.sh
+```
+
+This reverses everything the installer created. It does **not** remove the
+system packages (`arp-scan`, `nmap`, `python`), and it will only revoke
+`cap_net_raw` from `arp-scan` if you explicitly confirm — since that capability
+may be shared with other tools.
+
+> **Tip**: You can also simply delete the folder. To remove from the bar without
+> uninstalling the plugin, remove the `{ "id": "lu15ggtz.netscan" }` entry from
+> `~/.config/omarchy/shell.json` or run `omarchy plugin disable lu15ggtz.netscan`.
+
+---
+
 ## ⌨️ Shortcuts & Navigation
 
 | Key | Action |
