@@ -3,18 +3,152 @@ import sys
 import subprocess
 import json
 import re
-import socket
 import shutil
+import os
+import signal
+import select
+import time
+
+# ------------------------------------------------------------------------
+# Bounds. Every external process, every string we lift out of its output,
+# and the final JSON blob are capped so a hostile or noisy LAN (a device
+# that floods arp-scan replies, spoofs a giant DHCP hostname / nmap banner,
+# or otherwise tries to make this engine buffer without limit) can only
+# ever cost us a small, fixed amount of memory and time.
+# ------------------------------------------------------------------------
+MAX_PROC_BYTES = 512 * 1024      # cap on a single subprocess's stdout
+READ_CHUNK = 65536
+MAX_FIELD_LEN = 128               # cap on any single string field (vendor, service, version...)
+MAX_DEVICES = 512                 # cap on number of devices in a scan result
+MAX_PORTS = 300                   # cap on number of ports in a port-scan result
+MAX_JSON_BYTES = 1024 * 1024      # hard backstop on the final serialized JSON
+
+
+def _kill_process_group(proc):
+    """Best-effort kill of the whole process group we spawned the command in."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def run_bounded(cmd, timeout, max_bytes=MAX_PROC_BYTES):
+    """Run cmd in its own process group and return (stdout_bytes, truncated, timed_out).
+
+    Unlike subprocess.run(capture_output=True), this never buffers more than
+    max_bytes of stdout. On overflow *or* timeout the entire process group
+    (not just the immediate child) is killed with SIGKILL, so a helper
+    process spawned by nmap/arp-scan can't keep running or writing after we
+    give up on it.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # own process group -> safe to killpg
+        )
+    except (OSError, ValueError):
+        return b"", False, False
+
+    chunks = []
+    total = 0
+    truncated = False
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                ready, _, _ = select.select([fd], [], [], remaining)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                timed_out = True
+                break
+            try:
+                data = os.read(fd, READ_CHUNK)
+            except OSError:
+                break
+            if not data:
+                break  # EOF, process finished producing output
+            if total + len(data) > max_bytes:
+                data = data[: max_bytes - total]
+                if data:
+                    chunks.append(data)
+                    total += len(data)
+                truncated = True
+                break
+            chunks.append(data)
+            total += len(data)
+    finally:
+        if truncated or timed_out:
+            _kill_process_group(proc)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    return b"".join(chunks), truncated, timed_out
+
+
+def clamp(s, limit=MAX_FIELD_LEN):
+    """Bound the length of a string field lifted from untrusted process output."""
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if len(s) > limit:
+        s = s[:limit].rstrip() + "…"
+    return s
+
+
+def emit_json(obj):
+    """Serialize obj, shrinking list fields if needed to stay under MAX_JSON_BYTES.
+
+    Per-field and per-list-item caps already keep normal output well within
+    budget; this is a defensive backstop, not the primary control.
+    """
+    data = json.dumps(obj)
+    if len(data.encode("utf-8", "replace")) <= MAX_JSON_BYTES:
+        print(data)
+        return
+
+    obj["truncated"] = True
+    for list_key, count_key in (("devices", "deviceCount"), ("ports", "portCount")):
+        items = obj.get(list_key)
+        if not isinstance(items, list):
+            continue
+        while items and len(json.dumps(obj).encode("utf-8", "replace")) > MAX_JSON_BYTES:
+            items.pop()
+        obj[count_key] = len(items)
+
+    print(json.dumps(obj))
+
 
 def get_network_details():
     iface = ""
     gateway = ""
     subnet = ""
     local_ip = ""
-    
+
     try:
-        route_proc = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=2)
-        for line in route_proc.stdout.splitlines():
+        raw, _, _ = run_bounded(["ip", "route"], timeout=2, max_bytes=64 * 1024)
+        route_out = raw.decode("utf-8", "replace")
+        for line in route_out.splitlines():
             if line.startswith("default"):
                 parts = line.split()
                 if "via" in parts:
@@ -27,35 +161,37 @@ def get_network_details():
                     subnet = parts[0]
                 if "src" in parts:
                     local_ip = parts[parts.index("src") + 1]
-    except Exception as e:
+    except Exception:
         pass
 
-    return iface, gateway, subnet, local_ip
+    return clamp(iface, 32), clamp(gateway, 64), clamp(subnet, 64), clamp(local_ip, 64)
+
 
 def classify_device(ip, mac, vendor, gateway, local_ip):
     v_lower = vendor.lower()
     is_gw = (ip == gateway)
     is_self = (ip == local_ip)
-    
+
     if is_gw:
         return "󰒋", "Router / Gateway", True, False
     if is_self:
         return "󰍹", "This Device", False, True
-    
+
     # Phone / Tablet
     if any(k in v_lower for k in ["apple", "samsung", "xiaomi", "pixel", "oneplus", "motorola", "huawei phone", "oppo", "vivo"]):
         return "󰄡", "Phone / Mobile", False, False
-    
+
     # Smart device / IoT / Camera
     if any(k in v_lower for k in ["wyze", "amazon", "tuya", "sonoff", "nest", "roku", "espressif", "ring", "philips", "tp-link", "shelly"]):
         return "󰛳", "Smart IoT Device", False, False
-    
+
     # PC / Laptop
     if any(k in v_lower for k in ["intel", "dell", "hp", "lenovo", "asus", "gigabyte", "msi", "realtek", "asrock", "micro-star", "framework"]):
         return "󰌢", "Computer / Laptop", False, False
-    
+
     # Generic Network / Other
     return "󰛳", "Network Host", False, False
+
 
 def scan_network():
     iface, gateway, subnet, local_ip = get_network_details()
@@ -68,18 +204,21 @@ def scan_network():
             cmd = [arp_scan_bin, "--localnet"]
             if iface:
                 cmd.extend(["--interface", iface])
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-            for line in res.stdout.splitlines():
+            raw, _, _ = run_bounded(cmd, timeout=6, max_bytes=MAX_PROC_BYTES)
+            stdout = raw.decode("utf-8", "replace")
+            for line in stdout.splitlines():
+                if len(devices_dict) >= MAX_DEVICES:
+                    break
                 line = line.strip()
                 match = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)$", line)
                 if match:
                     ip, mac, vendor = match.groups()
-                    vendor = vendor.strip()
+                    vendor = clamp(vendor)
                     if vendor == "(Unknown: locally administered)":
                         vendor = "Locally Administered"
                     elif vendor == "(Unknown)":
                         vendor = "Unknown Vendor"
-                    
+
                     icon, category, is_gw, is_self = classify_device(ip, mac, vendor, gateway, local_ip)
                     devices_dict[ip] = {
                         "ip": ip,
@@ -94,8 +233,7 @@ def scan_network():
             pass
 
     # 2. Add local host if not present
-    if local_ip and local_ip not in devices_dict:
-        icon, category, is_gw, is_self = classify_device(local_ip, "", "Local Host", gateway, local_ip)
+    if local_ip and local_ip not in devices_dict and len(devices_dict) < MAX_DEVICES:
         devices_dict[local_ip] = {
             "ip": local_ip,
             "mac": "(local)",
@@ -108,8 +246,11 @@ def scan_network():
 
     # 3. Complement with `ip neigh show`
     try:
-        neigh_proc = subprocess.run(["ip", "-4", "neigh", "show"], capture_output=True, text=True, timeout=2)
-        for line in neigh_proc.stdout.splitlines():
+        raw, _, _ = run_bounded(["ip", "-4", "neigh", "show"], timeout=2, max_bytes=256 * 1024)
+        neigh_out = raw.decode("utf-8", "replace")
+        for line in neigh_out.splitlines():
+            if len(devices_dict) >= MAX_DEVICES:
+                break
             parts = line.split()
             if len(parts) >= 4 and "lladdr" in parts:
                 ip = parts[0]
@@ -152,7 +293,8 @@ def scan_network():
         "deviceCount": len(devices_list),
         "devices": devices_list
     }
-    print(json.dumps(output))
+    emit_json(output)
+
 
 def scan_ports(target_ip):
     if not target_ip or not re.match(r"^\d+\.\d+\.\d+\.\d+$", target_ip):
@@ -171,45 +313,47 @@ def scan_ports(target_ip):
     try:
         # Fast top ports scan
         cmd = [nmap_bin, "-Pn", "-F", "--open", "-T4", "--max-retries", "1", "--host-timeout", "4s", target_ip]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        
-        open_port_numbers = []
-        for line in res.stdout.splitlines():
+        raw, _, _ = run_bounded(cmd, timeout=5, max_bytes=MAX_PROC_BYTES)
+        stdout = raw.decode("utf-8", "replace")
+
+        for line in stdout.splitlines():
+            if len(ports) >= MAX_PORTS:
+                break
             line = line.strip()
             if "Host is up" in line:
                 host_up = True
                 m = re.search(r"\(([\d\.]+s) latency\)", line)
                 if m:
-                    latency = m.group(1)
-            
+                    latency = clamp(m.group(1), 32)
+
             m_port = re.match(r"^(\d+)/(\w+)\s+(\w+)\s+(\S+)(?:\s+(.*))?$", line)
             if m_port:
                 port_num, proto, state, service, ver = m_port.groups()
                 if state.lower() == "open":
-                    open_port_numbers.append(port_num)
                     ports.append({
                         "port": f"{port_num}/{proto}",
                         "portNum": int(port_num),
                         "protocol": proto,
                         "state": state,
-                        "service": service,
-                        "version": ver or ""
+                        "service": clamp(service),
+                        "version": clamp(ver or "")
                     })
 
     except subprocess.TimeoutExpired:
         pass
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e)}))
+        print(json.dumps({"status": "error", "message": clamp(str(e), 256)}))
         return
 
-    print(json.dumps({
+    emit_json({
         "status": "ok",
         "ip": target_ip,
         "hostUp": host_up or len(ports) > 0,
         "latency": latency or "< 1ms",
         "portCount": len(ports),
         "ports": ports
-    }))
+    })
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] == "scan":

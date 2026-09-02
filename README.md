@@ -43,6 +43,12 @@ sudo pacman -S arp-scan nmap python
 > sudo setcap cap_net_raw+p $(which arp-scan)
 > ```
 > `install.sh` will ask for your explicit confirmation before modifying this system-wide binary. If you decline, the plugin still works — `arp-scan` will simply run with standard privileges (you may need to run it under `sudo` instead).
+>
+> Before touching the binary, the installer verifies it is the real, unmodified
+> `/usr/bin/arp-scan` — canonical path (no `$PATH`-shadowing), root-owned,
+> not group/other-writable, and confirmed by `pacman` to both belong to the
+> `arp-scan` package and pass its file-integrity check. Any failure aborts
+> the step; it never falls back to trusting a bare `which arp-scan` hit.
 
 ---
 
@@ -110,6 +116,28 @@ may be shared with other tools.
 > **Tip**: You can also simply delete the folder. To remove from the bar without
 > uninstalling the plugin, remove the `{ "id": "lu15ggtz.netscan" }` entry from
 > `~/.config/omarchy/shell.json` or run `omarchy plugin disable lu15ggtz.netscan`.
+
+---
+
+## 🔒 Security notes
+
+- **Bounded scanning.** `ip`, `arp-scan`, and `nmap` are run in their own
+  process group with their stdout capped at a fixed size instead of buffered
+  without limit. If a host on the network floods a scan with an oversized
+  reply (or a scan simply hangs), the whole process group is killed
+  immediately on overflow or timeout — nothing is left running or growing
+  unbounded in memory.
+- **Bounded output.** Every string pulled from scan output (vendor name,
+  service, version, …), the number of devices/ports returned, and the final
+  JSON payload itself are all length-capped, so a malicious device can't use
+  a crafted response to blow up memory or the panel UI.
+- **`shell.json` writes are safe.** Both `install.sh` and `uninstall.sh` open
+  `~/.config/omarchy/shell.json` with `O_NOFOLLOW` (refusing to follow a
+  symlink planted at that path) and write changes atomically via a
+  same-directory temp file + `rename()`, never truncating the file in place.
+- **`setcap` is tightly bound**, as described above — canonical path, root
+  ownership, safe permissions, and `pacman` package/integrity verification,
+  every time, before any privileged write.
 
 ---
 
