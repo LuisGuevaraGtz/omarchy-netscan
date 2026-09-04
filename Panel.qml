@@ -732,7 +732,7 @@ Panel {
               anchors.topMargin: Style.space(8)
               spacing: Style.space(8)
 
-              // Top Row: IP + Badges & Action Buttons
+              // Top Row: IP + Badges
               RowLayout {
                 width: parent.width
 
@@ -768,68 +768,71 @@ Panel {
                 }
 
                 Item { Layout.fillWidth: true } // Spacer
+              }
 
-                // Action buttons: Copy IP & Nmap Port Scan
-                RowLayout {
-                  spacing: Style.space(6)
-                  Layout.alignment: Qt.AlignVCenter
+              // Action buttons: Copy IP, Rename, Nmap Port Scan, Deep Scan.
+              // A Flow (not a RowLayout) so that on a narrow panel four
+              // buttons wrap onto a second line instead of spilling past
+              // the drawer's right edge.
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
 
-                  Button {
-                    text: "Copy"
-                    iconText: "󰆏"
-                    tooltipText: "Copy IP (c)"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    horizontalPadding: Style.space(6)
-                    verticalPadding: Style.space(3)
-                    bordered: true
-                    onClicked: if (root.selectedIp) root.copyToClipboard(root.selectedIp)
-                  }
+                Button {
+                  text: "Copy"
+                  iconText: "󰆏"
+                  tooltipText: "Copy IP (c)"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(3)
+                  bordered: true
+                  onClicked: if (root.selectedIp) root.copyToClipboard(root.selectedIp)
+                }
 
-                  Button {
-                    text: "Rename"
-                    iconText: "󰑕"
-                    tooltipText: "Rename this device (n)"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    horizontalPadding: Style.space(6)
-                    verticalPadding: Style.space(3)
-                    bordered: true
-                    enabled: !!(root.selectedDevice && root.selectedDevice.mac)
-                    onClicked: root.startRename()
-                  }
+                Button {
+                  text: "Rename"
+                  iconText: "󰑕"
+                  tooltipText: "Rename this device (n)"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(3)
+                  bordered: true
+                  enabled: !!(root.selectedDevice && root.selectedDevice.mac)
+                  onClicked: root.startRename()
+                }
 
-                  Button {
-                    id: scanNmapBtn
-                    text: root.isScanningPorts ? "Scanning…" : "Scan (Nmap)"
-                    iconText: root.isScanningPorts ? "󰑐" : "󱂛"
-                    tooltipText: "Probe open ports on this host (s)"
-                    foreground: root.accentColor
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    bordered: true
-                    horizontalPadding: Style.space(8)
-                    verticalPadding: Style.space(3)
-                    enabled: !root.isScanningPorts && !root.isDeepScanning
-                    onClicked: if (root.selectedIp) root.triggerPortScan(root.selectedIp)
-                  }
+                Button {
+                  id: scanNmapBtn
+                  text: root.isScanningPorts ? "Scanning…" : "Scan (Nmap)"
+                  iconText: root.isScanningPorts ? "󰑐" : "󱂛"
+                  tooltipText: "Probe open ports on this host (s)"
+                  foreground: root.accentColor
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  bordered: true
+                  horizontalPadding: Style.space(8)
+                  verticalPadding: Style.space(3)
+                  enabled: !root.isScanningPorts && !root.isDeepScanning
+                  onClicked: if (root.selectedIp) root.triggerPortScan(root.selectedIp)
+                }
 
-                  Button {
-                    id: deepScanBtn
-                    text: root.isDeepScanning ? "Deep…" : "Deep"
-                    iconText: root.isDeepScanning ? "󰑐" : "󰦀"
-                    tooltipText: "Deep scan with nmap (service versions, banners, http/tls/upnp identity) — can take up to ~30s (Shift+S)"
-                    foreground: root.accentColor
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    bordered: true
-                    horizontalPadding: Style.space(8)
-                    verticalPadding: Style.space(3)
-                    enabled: !root.isScanningPorts && !root.isDeepScanning
-                    onClicked: if (root.selectedIp) root.triggerDeepScan(root.selectedIp)
-                  }
+                Button {
+                  id: deepScanBtn
+                  text: root.isDeepScanning ? "Deep…" : "Deep"
+                  iconText: root.isDeepScanning ? "󰑐" : "󰦀"
+                  tooltipText: "Deep scan with nmap (service versions, banners, http/tls/upnp identity) — can take up to ~30s (Shift+S)"
+                  foreground: root.accentColor
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  bordered: true
+                  horizontalPadding: Style.space(8)
+                  verticalPadding: Style.space(3)
+                  enabled: !root.isScanningPorts && !root.isDeepScanning
+                  onClicked: if (root.selectedIp) root.triggerDeepScan(root.selectedIp)
                 }
               }
 
