@@ -10,6 +10,7 @@ import signal
 import select
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 # ------------------------------------------------------------------------
 # Bounds. Every external process, every string we lift out of its output,
@@ -32,6 +33,11 @@ MAX_EXTRA_IPS = 16                # cap on alternate IPs recorded for one MAC (D
 MAX_ALIASES = 512          # cap on entries in aliases.json
 MAX_ALIAS_LEN = 48         # cap on characters of a single alias
 MAX_CONFIG_BYTES = 128 * 1024      # cap on aliases.json / snapshot file size we'll read
+
+# `inspect` (deep nmap scan) output bounds. product/versionNum/extrainfo/
+# httpTitle/tlsCN/upnpModel/banner all reuse MAX_FIELD_LEN via clamp().
+MAX_SCRIPT_OUTPUT = 256    # cap per NSE script output
+MAX_SCRIPTS_PER_PORT = 6   # cap on number of scripts recorded per port
 
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -565,6 +571,205 @@ def scan_ports(target_ip):
     })
 
 
+def _script_map(script_elems):
+    """id -> clamped output, capped at MAX_SCRIPTS_PER_PORT entries."""
+    out = {}
+    for s in script_elems[:MAX_SCRIPTS_PER_PORT]:
+        sid = clamp(s.get("id", ""), MAX_FIELD_LEN)
+        if not sid:
+            continue
+        out[sid] = clamp(s.get("output", ""), MAX_SCRIPT_OUTPUT)
+    return out
+
+
+def _extract_http_title(output):
+    """nmap's http-title script prefixes its output with "Site title: "."""
+    if not output:
+        return ""
+    text = output.strip()
+    prefix = "Site title: "
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    return clamp(text, MAX_FIELD_LEN)
+
+
+def _extract_tls_cn(output):
+    """First `commonName=` out of ssl-cert's "Subject: ..." line."""
+    if not output:
+        return ""
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("Subject:"):
+            m = re.search(r"commonName=([^/,\n]+)", line)
+            if m:
+                return clamp(m.group(1), MAX_FIELD_LEN)
+    return ""
+
+
+def _extract_upnp_model(output):
+    """First upnp-info line mentioning a model or manufacturer."""
+    if not output:
+        return ""
+    for line in output.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if "model" in low or "manufacturer" in low:
+            return clamp(line, MAX_FIELD_LEN)
+    return ""
+
+
+def inspect_host(ip):
+    """Deep nmap scan of `ip`: service versions + a handful of NSE scripts.
+
+    scan_ports() stays the fast path this doesn't touch; this is the
+    explicit, ~30s-budget "Deep" scan the UI gates behind its own button.
+    No -O/-sS: both need root, and only arp-scan gets cap_net_raw from the
+    installer, so they'd just fail silently.
+    """
+    if not ip or not _IP_RE.match(ip):
+        emit_json({"status": "error", "message": "Invalid target IP"})
+        return
+
+    nmap_bin = shutil.which("nmap")
+    if not nmap_bin:
+        emit_json({"status": "error", "message": "nmap binary not found"})
+        return
+
+    cmd = [
+        nmap_bin, "-Pn", "-sV", "--version-light", "-T4", "--open",
+        "--top-ports", "200", "--max-retries", "1", "--host-timeout", "25s",
+        "--script", "banner,http-title,ssl-cert,upnp-info",
+        "-oX", "-", ip,
+    ]
+    raw, truncated, timed_out = run_bounded(cmd, timeout=35, max_bytes=MAX_PROC_BYTES)
+
+    if truncated:
+        # The XML is necessarily incomplete -- don't try to salvage a
+        # fragment, just report it plainly.
+        emit_json({"status": "error", "message": "scan output truncated"})
+        return
+    if not raw:
+        msg = "nmap produced no output" + (" (timed out)" if timed_out else "")
+        emit_json({"status": "error", "message": msg})
+        return
+
+    try:
+        # Parsing only ever sees the buffer run_bounded() already capped at
+        # MAX_PROC_BYTES -- that cap is what keeps this within the memory
+        # budget the reviewer asked for; ElementTree itself doesn't resolve
+        # external entities, so there's no separate XXE surface here.
+        root_el = ET.fromstring(raw)
+    except ET.ParseError:
+        emit_json({"status": "error", "message": "failed to parse scan output"})
+        return
+    except Exception:
+        emit_json({"status": "error", "message": "failed to parse scan output"})
+        return
+
+    try:
+        host_el = root_el.find("host")
+        host_up = False
+        latency = "< 1ms"
+        ports = []
+        identity = {"httpTitle": "", "tlsCN": "", "upnpModel": "", "banner": ""}
+
+        def _feed_identity(sid, output):
+            if sid == "http-title" and not identity["httpTitle"]:
+                identity["httpTitle"] = _extract_http_title(output)
+            elif sid == "ssl-cert" and not identity["tlsCN"]:
+                identity["tlsCN"] = _extract_tls_cn(output)
+            elif sid == "upnp-info" and not identity["upnpModel"]:
+                identity["upnpModel"] = _extract_upnp_model(output)
+            elif sid == "banner" and not identity["banner"]:
+                identity["banner"] = clamp(output, MAX_FIELD_LEN)
+
+        if host_el is not None:
+            # nmap's own --host-timeout (not run_bounded's byte cap) can fire
+            # mid-scan -- most commonly because the `banner` NSE script waits
+            # out its full per-port read timeout against a service that never
+            # sends one unprompted. When that happens nmap still exits 0 with
+            # well-formed XML, but drops <ports>/<hostscript> entirely for
+            # that host, so silently reporting "ok" with everything empty
+            # would look like a real (if boring) result instead of a scan
+            # that never finished.
+            if host_el.get("timedout") == "true":
+                emit_json({"status": "error", "message": "scan timed out before finishing (host is slow to respond)"})
+                return
+
+            status_el = host_el.find("status")
+            if status_el is not None:
+                host_up = status_el.get("state") == "up"
+
+            times_el = host_el.find("times")
+            if times_el is not None:
+                srtt = times_el.get("srtt")
+                if srtt:
+                    try:
+                        latency = f"{int(srtt) / 1_000_000:.3f}s"
+                    except (ValueError, TypeError):
+                        latency = "< 1ms"
+
+            ports_el = host_el.find("ports")
+            if ports_el is not None:
+                for port_el in ports_el.findall("port"):
+                    if len(ports) >= MAX_PORTS:
+                        break
+                    state_el = port_el.find("state")
+                    if state_el is None or state_el.get("state") != "open":
+                        continue
+
+                    port_num = port_el.get("portid", "")
+                    protocol = clamp(port_el.get("protocol", ""), MAX_FIELD_LEN)
+
+                    service_el = port_el.find("service")
+                    service = product = version_num = extrainfo = ""
+                    if service_el is not None:
+                        service = clamp(service_el.get("name", ""))
+                        product = clamp(service_el.get("product", ""))
+                        version_num = clamp(service_el.get("version", ""))
+                        extrainfo = clamp(service_el.get("extrainfo", ""))
+                        tunnel = clamp(service_el.get("tunnel", ""))
+                        if tunnel:
+                            service = clamp(f"{tunnel}/{service}") if service else tunnel
+
+                    version_parts = [p for p in (product, version_num, extrainfo) if p]
+                    version = clamp(" ".join(version_parts))
+
+                    script_elems = port_el.findall("script")
+                    for s in script_elems:
+                        _feed_identity(s.get("id", ""), s.get("output", ""))
+
+                    ports.append({
+                        "port": f"{port_num}/{protocol}",
+                        "portNum": int(port_num) if port_num.isdigit() else 0,
+                        "protocol": protocol,
+                        "state": "open",
+                        "service": service,
+                        "version": version,
+                        "product": product,
+                        "versionNum": version_num,
+                        "extrainfo": extrainfo,
+                        "scripts": _script_map(script_elems)
+                    })
+
+            hostscript_el = host_el.find("hostscript")
+            if hostscript_el is not None:
+                for s in hostscript_el.findall("script"):
+                    _feed_identity(s.get("id", ""), s.get("output", ""))
+
+        emit_json({
+            "status": "ok",
+            "ip": ip,
+            "hostUp": host_up,
+            "latency": latency,
+            "portCount": len(ports),
+            "ports": ports,
+            "identity": identity
+        })
+    except Exception:
+        emit_json({"status": "error", "message": "failed to parse scan output"})
+
+
 def _clean_hostname(h, ip):
     """Bound and sanity-check a hostname pulled from a DNS/mDNS resolver.
 
@@ -698,5 +903,8 @@ if __name__ == "__main__":
     elif sys.argv[1] == "identify":
         target = sys.argv[2] if len(sys.argv) > 2 else ""
         identify_host(target)
+    elif sys.argv[1] == "inspect":
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
+        inspect_host(target)
     else:
         print(json.dumps({"status": "error", "message": "Unknown command"}))

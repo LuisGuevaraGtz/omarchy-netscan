@@ -47,6 +47,16 @@ Panel {
   property var hostnameCache: ({})
   property string identifyBuffer: ""
 
+  // Deep (nmap -sV + NSE scripts) inspection state. deepCache is indexed
+  // by IP so revisiting an already-inspected host redisplays instantly
+  // instead of paying the ~30s cost again.
+  property bool isDeepScanning: false
+  property bool deepScanDone: false
+  property var deviceIdentity: null
+  property var deepCache: ({})
+  property real deepResultTs: 0
+  property string deepBuffer: ""
+
   // Buffers for Process output
   property string scanBuffer: ""
   property string nmapBuffer: ""
@@ -62,14 +72,64 @@ Panel {
   }
 
   function triggerPortScan(ip) {
-    if (isScanningPorts || !ip) return
+    if (isScanningPorts || isDeepScanning || !ip) return
     isScanningPorts = true
     portScanDone = false
     currentPorts = []
     nmapBuffer = ""
     selectedIp = ip
+    deepScanDone = false
+    deviceIdentity = null
     nmapProc.command = [enginePath, "ports", ip]
     nmapProc.running = true
+  }
+
+  // Applies a finished (or cached) deep-scan result to the visible ports
+  // table / identity block. `entry` is {ports, identity, hostUp, latency,
+  // portCount, ts} as stashed in deepCache.
+  function applyDeepEntry(entry) {
+    root.currentPorts = entry.ports || []
+    root.portScanHostUp = !!entry.hostUp
+    root.portScanLatency = entry.latency || ""
+    root.deviceIdentity = entry.identity || null
+    root.deepResultTs = entry.ts || 0
+    root.deepScanDone = true
+    root.portScanDone = true
+  }
+
+  // Deep nmap inspection (service versions, banners, http-title/ssl-cert/
+  // upnp-info). Reuses the same result shape as the fast port scan --
+  // just with a few extra per-port fields -- so it renders through the
+  // same ports table. Cached per-IP: a repeat trigger for an already
+  // inspected host redisplays instantly instead of re-running nmap.
+  function triggerDeepScan(ip) {
+    if (!ip || root.isDeepScanning || root.isScanningPorts) return
+    var cached = root.deepCache[ip]
+    if (cached) {
+      root.applyDeepEntry(cached)
+      return
+    }
+    root.isDeepScanning = true
+    root.deepScanDone = false
+    root.portScanDone = false
+    root.deviceIdentity = null
+    root.currentPorts = []
+    root.deepBuffer = ""
+    deepProc.command = [root.enginePath, "inspect", ip]
+    deepProc.running = true
+  }
+
+  // One-shot "Xs/Xm/Xh ago" label for a deep-scan result. Computed once
+  // when the result is (re)displayed rather than ticking live.
+  function formatAge(ts) {
+    if (!ts) return ""
+    var secs = Math.max(0, Math.round((Date.now() - ts) / 1000))
+    if (secs < 5) return "just now"
+    if (secs < 60) return secs + "s ago"
+    var mins = Math.round(secs / 60)
+    if (mins < 60) return mins + "m ago"
+    var hours = Math.round(mins / 60)
+    return hours + "h ago"
   }
 
   function copyToClipboard(text) {
@@ -91,6 +151,8 @@ Panel {
     selectedIndex = idx
     portScanDone = false
     currentPorts = []
+    deepScanDone = false
+    deviceIdentity = null
     renaming = false
     // Restarted on every navigation step -- identifyProc only actually
     // fires once the user stops moving for 400ms, so tapping through j/k
@@ -268,6 +330,42 @@ Panel {
   }
 
   Process {
+    id: deepProc
+    stdout: SplitParser {
+      onRead: function(data) {
+        root.deepBuffer += data
+      }
+    }
+    onExited: function(exitCode) {
+      root.isDeepScanning = false
+      if (exitCode === 0 && root.deepBuffer.length > 0) {
+        try {
+          var res = JSON.parse(root.deepBuffer)
+          if (res.status === "ok") {
+            var entry = {
+              ports: res.ports || [],
+              identity: res.identity || {},
+              hostUp: res.hostUp,
+              latency: res.latency,
+              portCount: res.portCount,
+              ts: Date.now()
+            }
+            var updated = Object.assign({}, root.deepCache)
+            updated[res.ip] = entry
+            root.deepCache = updated
+            if (res.ip === root.selectedIp) {
+              root.applyDeepEntry(entry)
+            }
+          }
+        } catch (e) {
+          console.log("[netscan] Error parsing inspect JSON:", e)
+        }
+      }
+      root.deepBuffer = ""
+    }
+  }
+
+  Process {
     id: copyProc
     command: ["wl-copy", root.copyTarget]
   }
@@ -334,8 +432,10 @@ Panel {
       onTextKey: function(t) {
         if (root.renaming) return  // belt-and-suspenders; `blocked` already covers this
         if (t === "r" || t === "R") root.triggerScan()
-        else if (t === "s" || t === "S" || t === "p" || t === "P") {
+        else if (t === "s" || t === "p") {
           if (root.selectedIp) root.triggerPortScan(root.selectedIp)
+        } else if (t === "S" || t === "P") {
+          if (root.selectedIp) root.triggerDeepScan(root.selectedIp)
         } else if (t === "c" || t === "C") {
           if (root.selectedIp) root.copyToClipboard(root.selectedIp)
         } else if (t === "n" || t === "N") {
@@ -712,8 +812,23 @@ Panel {
                     bordered: true
                     horizontalPadding: Style.space(8)
                     verticalPadding: Style.space(3)
-                    enabled: !root.isScanningPorts
+                    enabled: !root.isScanningPorts && !root.isDeepScanning
                     onClicked: if (root.selectedIp) root.triggerPortScan(root.selectedIp)
+                  }
+
+                  Button {
+                    id: deepScanBtn
+                    text: root.isDeepScanning ? "Deep…" : "Deep"
+                    iconText: root.isDeepScanning ? "󰑐" : "󰦀"
+                    tooltipText: "Deep scan with nmap (service versions, banners, http/tls/upnp identity) — can take up to ~30s (Shift+S)"
+                    foreground: root.accentColor
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    bordered: true
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    enabled: !root.isScanningPorts && !root.isDeepScanning
+                    onClicked: if (root.selectedIp) root.triggerDeepScan(root.selectedIp)
                   }
                 }
               }
@@ -868,7 +983,7 @@ Panel {
 
               // NMAP RESULTS SECTION
               Item {
-                visible: root.isScanningPorts || root.portScanDone
+                visible: root.isScanningPorts || root.isDeepScanning || root.portScanDone
                 width: parent.width
                 implicitHeight: nmapResultsColumn.implicitHeight
 
@@ -883,15 +998,103 @@ Panel {
                     width: parent.width
 
                     Text {
-                      text: root.isScanningPorts
-                        ? "PROBING SERVICES (NMAP)..."
-                        : ("OPEN PORTS (" + root.currentPorts.length + ") \u00b7 " + root.portScanLatency)
-                      color: root.isScanningPorts ? root.accentColor : Qt.darker(root.foreground, 1.3)
+                      text: root.isDeepScanning
+                        ? "DEEP SCAN \u2014 THIS MAY TAKE ~30s..."
+                        : (root.isScanningPorts
+                            ? "PROBING SERVICES (NMAP)..."
+                            : ("OPEN PORTS (" + root.currentPorts.length + ") \u00b7 " + root.portScanLatency))
+                      color: (root.isDeepScanning || root.isScanningPorts) ? root.accentColor : Qt.darker(root.foreground, 1.3)
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption - 1
                       font.bold: true
                       Layout.fillWidth: true
                     }
+
+                    Text {
+                      visible: root.deepScanDone && !root.isDeepScanning && root.deepResultTs > 0
+                      text: "deep scan \u00b7 " + root.formatAge(root.deepResultTs)
+                      color: Qt.darker(root.foreground, 1.6)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption - 1
+                    }
+                  }
+
+                  // Identity block -- httpTitle/tlsCN/upnpModel from a deep
+                  // scan. Only ever populated by deep scans; hidden entirely
+                  // when nothing came back (a fast scan, or a deep scan that
+                  // found nothing to report here).
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(2)
+                    visible: !!(root.deviceIdentity && (root.deviceIdentity.httpTitle || root.deviceIdentity.tlsCN || root.deviceIdentity.upnpModel))
+
+                    RowLayout {
+                      width: parent.width
+                      spacing: Style.space(6)
+                      visible: !!(root.deviceIdentity && root.deviceIdentity.httpTitle)
+
+                      Text {
+                        text: "Title:"
+                        color: Qt.darker(root.foreground, 1.5)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                      Text {
+                        text: root.deviceIdentity ? root.deviceIdentity.httpTitle : ""
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    RowLayout {
+                      width: parent.width
+                      spacing: Style.space(6)
+                      visible: !!(root.deviceIdentity && root.deviceIdentity.tlsCN)
+
+                      Text {
+                        text: "TLS CN:"
+                        color: Qt.darker(root.foreground, 1.5)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                      Text {
+                        text: root.deviceIdentity ? root.deviceIdentity.tlsCN : ""
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    RowLayout {
+                      width: parent.width
+                      spacing: Style.space(6)
+                      visible: !!(root.deviceIdentity && root.deviceIdentity.upnpModel)
+
+                      Text {
+                        text: "UPnP:"
+                        color: Qt.darker(root.foreground, 1.5)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                      Text {
+                        text: root.deviceIdentity ? root.deviceIdentity.upnpModel : ""
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    PanelSeparator { width: parent.width }
                   }
 
                   // Ports Table
@@ -965,7 +1168,7 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
-            text: "j/k: navigate  \u00b7  s: scan ports  \u00b7  n: rename  \u00b7  r: refresh  \u00b7  esc: close"
+            text: "j/k: navigate  \u00b7  s: scan ports  \u00b7  S: deep scan  \u00b7  n: rename  \u00b7  r: refresh  \u00b7  esc: close"
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
             color: Qt.darker(root.foreground, 1.7)
