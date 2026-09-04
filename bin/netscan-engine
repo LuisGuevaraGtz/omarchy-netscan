@@ -5,8 +5,10 @@ import json
 import re
 import shutil
 import os
+import stat
 import signal
 import select
+import tempfile
 import time
 
 # ------------------------------------------------------------------------
@@ -22,6 +24,167 @@ MAX_FIELD_LEN = 128               # cap on any single string field (vendor, serv
 MAX_DEVICES = 512                 # cap on number of devices in a scan result
 MAX_PORTS = 300                   # cap on number of ports in a port-scan result
 MAX_JSON_BYTES = 1024 * 1024      # hard backstop on the final serialized JSON
+MAX_EXTRA_IPS = 16                # cap on alternate IPs recorded for one MAC (DHCP churn)
+
+# Alias store (user-assigned device nicknames). Config, not scan output, but
+# still bounded: a corrupted or hand-edited aliases.json shouldn't be able to
+# make the engine buffer or iterate without limit either.
+MAX_ALIASES = 512          # cap on entries in aliases.json
+MAX_ALIAS_LEN = 48         # cap on characters of a single alias
+MAX_CONFIG_BYTES = 128 * 1024      # cap on aliases.json / snapshot file size we'll read
+
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_IFACE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+
+
+def normalize_mac(s):
+    """Lowercase + colon-normalize a MAC, or "" if it doesn't validate.
+
+    Every MAC that ends up in devices_dict, the alias store, or a snapshot
+    filename goes through here first -- it's the one place that decides
+    whether something is allowed to be treated as a MAC address.
+    """
+    if not s:
+        return ""
+    s = str(s).strip().lower().replace("-", ":")
+    return s if _MAC_RE.match(s) else ""
+
+
+def sanitize_alias(s):
+    """Strip control chars, collapse whitespace, and clamp an alias string."""
+    if s is None:
+        return ""
+    s = _CONTROL_CHARS_RE.sub("", str(s))
+    s = re.sub(r"\s+", " ", s).strip()
+    return clamp(s, MAX_ALIAS_LEN)
+
+
+def _xdg_config_home():
+    v = os.environ.get("XDG_CONFIG_HOME")
+    return v if v else os.path.join(os.path.expanduser("~"), ".config")
+
+
+def _xdg_state_home():
+    v = os.environ.get("XDG_STATE_HOME")
+    return v if v else os.path.join(os.path.expanduser("~"), ".local", "state")
+
+
+def _ensure_dir(path, mode=0o700):
+    """mkdir -p `path` and force its mode, regardless of umask."""
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _read_json_safe(path, max_bytes):
+    """Read+parse a small JSON file defensively. Never raises.
+
+    Refuses symlinks (O_NOFOLLOW), non-regular files, and anything over
+    max_bytes. Returns None on any failure -- callers treat that the same
+    as "file doesn't exist / has no usable content".
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    f = None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            os.close(fd)
+            return None
+        f = os.fdopen(fd, "rb")
+        data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        return json.loads(data.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    finally:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def _write_json_atomic(path, obj, file_mode=0o600):
+    """Write JSON to `path` atomically: temp file in the same dir, fsync,
+    os.replace(). Never truncates the target in place. Returns True/False.
+    """
+    dir_name = os.path.dirname(path) or "."
+    _ensure_dir(dir_name)
+    try:
+        fd_tmp, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=dir_name)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd_tmp, "w") as tf:
+            json.dump(obj, tf)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.chmod(tmp_path, file_mode)
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def alias_path():
+    """Resolve the aliases.json path. Does not create anything."""
+    return os.path.join(_xdg_config_home(), "omarchy-netscan", "aliases.json")
+
+
+def load_aliases():
+    """Return dict[mac, name]. Never raises -- any problem just yields {}."""
+    data = _read_json_safe(alias_path(), MAX_CONFIG_BYTES)
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("aliases")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        if len(out) >= MAX_ALIASES:
+            break
+        mac = normalize_mac(k)
+        if not mac:
+            continue
+        name = sanitize_alias(v)
+        if not name:
+            continue
+        out[mac] = name
+    return out
+
+
+def save_aliases(d):
+    if len(d) > MAX_ALIASES:
+        d = dict(list(d.items())[:MAX_ALIASES])
+    return _write_json_atomic(alias_path(), {"schemaVersion": 1, "aliases": d})
+
+
+def _read_local_mac(iface):
+    """Read the real MAC of `iface` straight from sysfs (no subprocess)."""
+    if not iface or not _IFACE_RE.match(iface):
+        return ""
+    path = f"/sys/class/net/{iface}/address"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return ""
+    try:
+        with os.fdopen(fd, "r") as f:
+            mac = f.read(128)
+    except OSError:
+        return ""
+    return normalize_mac(mac.strip())
 
 
 def _kill_process_group(proc):
@@ -193,9 +356,28 @@ def classify_device(ip, mac, vendor, gateway, local_ip):
     return "󰛳", "Network Host", False, False
 
 
-def scan_network():
+def _discover_devices():
+    """Run arp-scan + local host + `ip neigh` discovery.
+
+    Returns (iface, gateway, subnet, local_ip, devices_list). devices_list
+    is already MAC-deduped (one entry per distinct MAC, extra IPs folded
+    into "extraIps") and sorted gateway-first/self-second/numeric-IP after.
+    Carries no "alias" field -- callers that want aliases attach them.
+    """
     iface, gateway, subnet, local_ip = get_network_details()
-    devices_dict = {}
+    devices_dict = {}   # key: normalized MAC, or "self:<ip>" if we couldn't read one
+
+    def add_or_merge(key, entry):
+        existing = devices_dict.get(key)
+        if existing is not None:
+            ip = entry["ip"]
+            if ip != existing["ip"] and ip not in existing["extraIps"] and len(existing["extraIps"]) < MAX_EXTRA_IPS:
+                existing["extraIps"].append(ip)
+            return
+        if len(devices_dict) >= MAX_DEVICES:
+            return
+        entry["extraIps"] = []
+        devices_dict[key] = entry
 
     # 1. Try arp-scan first (fastest and gives MAC vendor)
     arp_scan_bin = shutil.which("arp-scan")
@@ -211,62 +393,80 @@ def scan_network():
                     break
                 line = line.strip()
                 match = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)$", line)
-                if match:
-                    ip, mac, vendor = match.groups()
-                    vendor = clamp(vendor)
-                    if vendor == "(Unknown: locally administered)":
-                        vendor = "Locally Administered"
-                    elif vendor == "(Unknown)":
-                        vendor = "Unknown Vendor"
+                if not match:
+                    continue
+                ip, mac_raw, vendor = match.groups()
+                mac = normalize_mac(mac_raw)
+                if not mac:
+                    continue
+                vendor = clamp(vendor)
+                if vendor == "(Unknown: locally administered)":
+                    vendor = "Locally Administered"
+                elif vendor == "(Unknown)":
+                    vendor = "Unknown Vendor"
 
-                    icon, category, is_gw, is_self = classify_device(ip, mac, vendor, gateway, local_ip)
-                    devices_dict[ip] = {
-                        "ip": ip,
-                        "mac": mac.lower(),
-                        "vendor": vendor,
-                        "icon": icon,
-                        "category": category,
-                        "isGateway": is_gw,
-                        "isSelf": is_self
-                    }
+                icon, category, is_gw, is_self = classify_device(ip, mac, vendor, gateway, local_ip)
+                add_or_merge(mac, {
+                    "ip": ip,
+                    "mac": mac,
+                    "vendor": vendor,
+                    "icon": icon,
+                    "category": category,
+                    "isGateway": is_gw,
+                    "isSelf": is_self
+                })
         except Exception:
             pass
 
-    # 2. Add local host if not present
-    if local_ip and local_ip not in devices_dict and len(devices_dict) < MAX_DEVICES:
-        devices_dict[local_ip] = {
+    # 2. Add local host if not already present under some MAC
+    local_present = any(d["ip"] == local_ip for d in devices_dict.values()) if local_ip else True
+    if local_ip and not local_present and len(devices_dict) < MAX_DEVICES:
+        local_mac = _read_local_mac(iface)
+        key = local_mac if local_mac else f"self:{local_ip}"
+        add_or_merge(key, {
             "ip": local_ip,
-            "mac": "(local)",
+            "mac": local_mac,  # "" if we couldn't read it -- UI shouldn't show junk
             "vendor": "This Computer",
             "icon": "󰍹",
             "category": "This Device",
             "isGateway": False,
             "isSelf": True
-        }
+        })
 
-    # 3. Complement with `ip neigh show`
+    # 3. Complement with `ip neigh show`, deduped by MAC. An IP already
+    # accounted for (as a primary IP or an extraIp) is skipped rather than
+    # trusted again here -- the kernel neighbor table can be stale and we'd
+    # rather not spawn a conflicting-MAC duplicate for an IP arp-scan already
+    # resolved.
     try:
         raw, _, _ = run_bounded(["ip", "-4", "neigh", "show"], timeout=2, max_bytes=256 * 1024)
         neigh_out = raw.decode("utf-8", "replace")
+        seen_ips = set()
+        for d in devices_dict.values():
+            seen_ips.add(d["ip"])
+            seen_ips.update(d["extraIps"])
         for line in neigh_out.splitlines():
             if len(devices_dict) >= MAX_DEVICES:
                 break
             parts = line.split()
-            if len(parts) >= 4 and "lladdr" in parts:
-                ip = parts[0]
-                mac = parts[parts.index("lladdr") + 1].lower()
-                state = parts[-1]
-                if state in ["REACHABLE", "STALE", "DELAY", "PROBE"] and ip not in devices_dict:
-                    icon, category, is_gw, is_self = classify_device(ip, mac, "Unknown Host", gateway, local_ip)
-                    devices_dict[ip] = {
-                        "ip": ip,
-                        "mac": mac,
-                        "vendor": "Network Device",
-                        "icon": icon,
-                        "category": category,
-                        "isGateway": is_gw,
-                        "isSelf": is_self
-                    }
+            if len(parts) < 4 or "lladdr" not in parts:
+                continue
+            ip = parts[0]
+            mac = normalize_mac(parts[parts.index("lladdr") + 1])
+            state = parts[-1]
+            if not mac or state not in ("REACHABLE", "STALE", "DELAY", "PROBE") or ip in seen_ips:
+                continue
+            icon, category, is_gw, is_self = classify_device(ip, mac, "Unknown Host", gateway, local_ip)
+            add_or_merge(mac, {
+                "ip": ip,
+                "mac": mac,
+                "vendor": "Network Device",
+                "icon": icon,
+                "category": category,
+                "isGateway": is_gw,
+                "isSelf": is_self
+            })
+            seen_ips.add(ip)
     except Exception:
         pass
 
@@ -283,6 +483,15 @@ def scan_network():
             return (3, 0, 0, 0, 0)
 
     devices_list = sorted(devices_dict.values(), key=sort_key)
+    return iface, gateway, subnet, local_ip, devices_list
+
+
+def scan_network():
+    iface, gateway, subnet, local_ip, devices_list = _discover_devices()
+
+    aliases = load_aliases()
+    for d in devices_list:
+        d["alias"] = aliases.get(d["mac"], "") if d["mac"] else ""
 
     output = {
         "status": "ok",
@@ -355,11 +564,70 @@ def scan_ports(target_ip):
     })
 
 
+def cmd_alias(args):
+    """Dispatch `alias list|set|rm ...`. Always prints JSON, never free text."""
+    if not args:
+        emit_json({"status": "error", "message": "Usage: alias <list|set|rm> ..."})
+        return
+
+    action = args[0]
+
+    if action == "list":
+        d = load_aliases()
+        emit_json({"status": "ok", "aliases": d, "count": len(d)})
+        return
+
+    if action == "set":
+        if len(args) < 3:
+            emit_json({"status": "error", "message": "Usage: alias set <mac> <name...>"})
+            return
+        mac = normalize_mac(args[1])
+        if not mac:
+            emit_json({"status": "error", "message": "Invalid MAC address"})
+            return
+        name = sanitize_alias(" ".join(args[2:]))
+        if not name:
+            emit_json({"status": "error", "message": "Alias is empty after sanitizing"})
+            return
+        d = load_aliases()
+        if mac not in d and len(d) >= MAX_ALIASES:
+            emit_json({"status": "error", "message": "Alias store is full"})
+            return
+        d[mac] = name
+        if not save_aliases(d):
+            emit_json({"status": "error", "message": "Failed to save alias"})
+            return
+        emit_json({"status": "ok", "mac": mac, "alias": name})
+        return
+
+    if action == "rm":
+        if len(args) < 2:
+            emit_json({"status": "error", "message": "Usage: alias rm <mac>"})
+            return
+        mac = normalize_mac(args[1])
+        if not mac:
+            emit_json({"status": "error", "message": "Invalid MAC address"})
+            return
+        d = load_aliases()
+        removed = mac in d
+        if removed:
+            del d[mac]
+            if not save_aliases(d):
+                emit_json({"status": "error", "message": "Failed to save alias store"})
+                return
+        emit_json({"status": "ok", "mac": mac, "removed": removed})
+        return
+
+    emit_json({"status": "error", "message": f"Unknown alias subcommand: {clamp(action, 32)}"})
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] == "scan":
         scan_network()
     elif sys.argv[1] == "ports":
         target = sys.argv[2] if len(sys.argv) > 2 else ""
         scan_ports(target)
+    elif sys.argv[1] == "alias":
+        cmd_alias(sys.argv[2:])
     else:
         print(json.dumps({"status": "error", "message": "Unknown command"}))

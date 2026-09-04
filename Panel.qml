@@ -36,6 +36,12 @@ Panel {
   property string portScanLatency: ""
   property var currentPorts: []
 
+  // Rename (alias) state
+  property bool renaming: false
+  property string aliasBuffer: ""
+  property int aliasTargetIndex: -1
+  property string aliasTargetName: ""
+
   // Buffers for Process output
   property string scanBuffer: ""
   property string nmapBuffer: ""
@@ -80,6 +86,33 @@ Panel {
     selectedIndex = idx
     portScanDone = false
     currentPorts = []
+    renaming = false
+  }
+
+  function startRename() {
+    if (!root.selectedDevice || !root.selectedDevice.mac) return
+    root.renaming = true
+  }
+
+  function cancelRename() {
+    root.renaming = false
+  }
+
+  // Saves (or clears, if `newName` is blank) the alias for the currently
+  // selected device. Does not re-scan: on success the in-memory model is
+  // patched directly from aliasProc.onExited.
+  function commitRename(newName) {
+    root.renaming = false
+    if (!root.selectedDevice || !root.selectedDevice.mac) return
+    var mac = root.selectedDevice.mac
+    var trimmed = (newName || "").trim()
+    root.aliasTargetIndex = root.selectedIndex
+    root.aliasTargetName = trimmed
+    root.aliasBuffer = ""
+    aliasProc.command = trimmed.length > 0
+      ? [root.enginePath, "alias", "set", mac, trimmed]
+      : [root.enginePath, "alias", "rm", mac]
+    aliasProc.running = true
   }
 
   function nextDevice() {
@@ -162,6 +195,33 @@ Panel {
   }
 
   Process {
+    id: aliasProc
+    stdout: SplitParser {
+      onRead: function(data) {
+        root.aliasBuffer += data
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && root.aliasBuffer.length > 0) {
+        try {
+          var res = JSON.parse(root.aliasBuffer)
+          if (res.status === "ok" && root.aliasTargetIndex >= 0 && root.aliasTargetIndex < root.devices.length) {
+            var updated = root.devices.slice()
+            var dev = Object.assign({}, updated[root.aliasTargetIndex])
+            dev.alias = root.aliasTargetName
+            updated[root.aliasTargetIndex] = dev
+            root.devices = updated
+          }
+        } catch (e) {
+          console.log("[netscan] Error parsing alias JSON:", e)
+        }
+      }
+      root.aliasBuffer = ""
+      root.aliasTargetIndex = -1
+    }
+  }
+
+  Process {
     id: copyProc
     command: ["wl-copy", root.copyTarget]
   }
@@ -215,6 +275,10 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the rename TextField is open it must own every keystroke --
+      // otherwise typing a device's new name would be read as a stream of
+      // shortcut letters (r/s/c/...) and trigger rescans mid-edit.
+      blocked: root.renaming
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
         if (dy > 0) root.nextDevice()
@@ -222,11 +286,14 @@ Panel {
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
+        if (root.renaming) return  // belt-and-suspenders; `blocked` already covers this
         if (t === "r" || t === "R") root.triggerScan()
         else if (t === "s" || t === "S" || t === "p" || t === "P") {
           if (root.selectedIp) root.triggerPortScan(root.selectedIp)
         } else if (t === "c" || t === "C") {
           if (root.selectedIp) root.copyToClipboard(root.selectedIp)
+        } else if (t === "n" || t === "N") {
+          root.startRename()
         }
       }
 
@@ -433,13 +500,39 @@ Panel {
                   }
                 }
 
-                Text {
-                  text: devRow.modelData.vendor || devRow.modelData.category
-                  color: Qt.darker(root.foreground, 1.4)
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+                RowLayout {
                   width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    visible: !!devRow.modelData.alias
+                    text: devRow.modelData.alias
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    visible: !!devRow.modelData.alias
+                    text: "(" + (devRow.modelData.vendor || devRow.modelData.category) + ")"
+                    color: Qt.darker(root.foreground, 1.4)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                  }
+
+                  Text {
+                    visible: !devRow.modelData.alias
+                    text: devRow.modelData.vendor || devRow.modelData.category
+                    color: Qt.darker(root.foreground, 1.4)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                  }
                 }
               }
 
@@ -549,6 +642,20 @@ Panel {
                   }
 
                   Button {
+                    text: "Rename"
+                    iconText: "󰑕"
+                    tooltipText: "Rename this device (n)"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(3)
+                    bordered: true
+                    enabled: !!(root.selectedDevice && root.selectedDevice.mac)
+                    onClicked: root.startRename()
+                  }
+
+                  Button {
                     id: scanNmapBtn
                     text: root.isScanningPorts ? "Scanning…" : "Scan (Nmap)"
                     iconText: root.isScanningPorts ? "󰑐" : "󱂛"
@@ -569,6 +676,62 @@ Panel {
               Column {
                 width: parent.width
                 spacing: Style.space(2)
+
+                // Name row -- shows the alias, or lets you type a new one.
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  visible: !root.renaming
+
+                  Text {
+                    text: "Name:"
+                    color: Qt.darker(root.foreground, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    text: (root.selectedDevice && root.selectedDevice.alias) ? root.selectedDevice.alias : "— sin nombre —"
+                    color: (root.selectedDevice && root.selectedDevice.alias) ? root.foreground : Qt.darker(root.foreground, 1.6)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: !!(root.selectedDevice && root.selectedDevice.alias)
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                  }
+                }
+
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  visible: root.renaming
+
+                  Text {
+                    text: "Name:"
+                    color: Qt.darker(root.foreground, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  TextField {
+                    id: renameField
+                    Layout.fillWidth: true
+                    foreground: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(2)
+                    text: root.selectedDevice ? (root.selectedDevice.alias || "") : ""
+
+                    onAccepted: root.commitRename(text)
+                    Keys.onEscapePressed: root.cancelRename()
+
+                    onVisibleChanged: if (visible) Qt.callLater(function() { renameField.forceActiveFocus(); renameField.selectAll() })
+                    Component.onCompleted: if (visible) Qt.callLater(function() { renameField.forceActiveFocus(); renameField.selectAll() })
+                  }
+                }
 
                 RowLayout {
                   width: parent.width
@@ -730,7 +893,7 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
-            text: "j/k: navigate  \u00b7  s: scan ports  \u00b7  r: refresh  \u00b7  esc: close"
+            text: "j/k: navigate  \u00b7  s: scan ports  \u00b7  n: rename  \u00b7  r: refresh  \u00b7  esc: close"
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
             color: Qt.darker(root.foreground, 1.7)
