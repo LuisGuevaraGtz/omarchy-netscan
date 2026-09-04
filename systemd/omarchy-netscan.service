@@ -1,0 +1,18 @@
+[Unit]
+Description=Omarchy netscan snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/omarchy/plugins/lu15ggtz.netscan/bin/netscan-engine snapshot
+PrivateTmp=yes
+
+# Deliberately NOT setting NoNewPrivileges=yes: it would block file
+# capabilities from taking effect, and arp-scan needs its cap_net_raw+p
+# (granted, opt-in, by install.sh -- see there for the verification that
+# precedes it) to do an unprivileged raw-packet scan. This unit runs as
+# the user, does exactly the same bounded work
+# (run_bounded()/killpg/clamp()-everything, see bin/netscan-engine) as the
+# interactive plugin, and the one capability involved lives on arp-scan's
+# binary, not on this unit or this service -- NoNewPrivileges=yes would add
+# no real security margin here, it would just silently turn the scan into
+# an empty result every time the timer fires.

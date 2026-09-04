@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Omarchy netscan snapshot
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

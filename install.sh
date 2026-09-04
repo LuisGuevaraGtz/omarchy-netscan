@@ -144,9 +144,16 @@ if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
   echo "Omarchy Network Scanner"
   echo "======================="
   echo "Usage:"
-  echo "  omarchy-netscan             Toggle the floating Network Scanner panel in Omarchy bar"
-  echo "  omarchy-netscan --cli       Run fast ARP network discovery in terminal"
-  echo "  omarchy-netscan --ports IP  Scan open ports on a specific IP in terminal"
+  echo "  omarchy-netscan                  Toggle the floating Network Scanner panel in Omarchy bar"
+  echo "  omarchy-netscan --cli            Run fast ARP network discovery in terminal"
+  echo "  omarchy-netscan --ports IP       Scan open ports on a specific IP in terminal"
+  echo "  omarchy-netscan --watch on       Enable the periodic background snapshot timer"
+  echo "  omarchy-netscan --watch off      Disable it"
+  echo "  omarchy-netscan --watch status   Show whether it's enabled/running"
+  echo
+  echo "The watch timer runs 'netscan-engine snapshot' every ~15 minutes via a"
+  echo "systemd --user timer; it notifies about newly seen devices and leaves"
+  echo "nothing running between runs. It's opt-in -- see install.sh."
   exit 0
 fi
 
@@ -164,6 +171,31 @@ if [ "$1" == "--ports" ]; then
   exit 0
 fi
 
+if [ "$1" == "--watch" ]; then
+  if ! command -v systemctl &>/dev/null; then
+    echo "Error: systemctl not found; the watch timer needs systemd --user."
+    exit 1
+  fi
+  case "$2" in
+    on)
+      systemctl --user enable --now omarchy-netscan.timer && \
+        echo "Watch timer enabled (runs every ~15 minutes)."
+      ;;
+    off)
+      systemctl --user disable --now omarchy-netscan.timer && \
+        echo "Watch timer disabled."
+      ;;
+    status)
+      systemctl --user status omarchy-netscan.timer --no-pager
+      ;;
+    *)
+      echo "Usage: omarchy-netscan --watch on|off|status"
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
 if command -v omarchy-shell &>/dev/null; then
   omarchy-shell shell toggle "$PLUGIN_ID"
 else
@@ -172,7 +204,33 @@ fi
 EOF
 chmod +x "$HOME/.local/bin/omarchy-netscan"
 
-# 5. Optionally enable in shell.json (only with explicit user consent).
+# 5. Install the (opt-in) systemd --user units for periodic snapshots /
+# new-device notifications. Installing the unit files is harmless on its
+# own -- nothing runs until the timer is enabled, which we only do with
+# explicit confirmation, same as setcap and shell.json above. Default: no.
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+mkdir -p "$SYSTEMD_USER_DIR"
+cp "$SCRIPT_DIR/systemd/omarchy-netscan.service" "$SYSTEMD_USER_DIR/"
+cp "$SCRIPT_DIR/systemd/omarchy-netscan.timer" "$SYSTEMD_USER_DIR/"
+
+if command -v systemctl &>/dev/null; then
+  systemctl --user daemon-reload 2>/dev/null || true
+  read -r -p "[?] Enable the periodic background scan (new-device notifications, every ~15 min)? [y/N] " ans
+  case "$ans" in
+    [yY]|[yY][eE][sS])
+      systemctl --user enable --now omarchy-netscan.timer && \
+        echo "[*] Watch timer enabled. Manage it later with: omarchy-netscan --watch on|off|status" || \
+        echo "[!] Could not enable the timer; try 'omarchy-netscan --watch on' later."
+      ;;
+    *)
+      echo "[*] Leaving the watch timer disabled. Enable it later with: omarchy-netscan --watch on"
+      ;;
+  esac
+else
+  echo "[!] systemctl not found; skipping the periodic scan timer (systemd --user is required)."
+fi
+
+# 6. Optionally enable in shell.json (only with explicit user consent).
 # We never modify the user's bar configuration without confirmation, and the
 # mutation itself is safe against a symlink/TOCTOU attack on shell.json: the
 # helper script opens the file with O_NOFOLLOW (refusing if it's a symlink),

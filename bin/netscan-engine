@@ -10,6 +10,8 @@ import signal
 import select
 import tempfile
 import time
+import fcntl
+import hashlib
 import xml.etree.ElementTree as ET
 
 # ------------------------------------------------------------------------
@@ -38,6 +40,11 @@ MAX_CONFIG_BYTES = 128 * 1024      # cap on aliases.json / snapshot file size we
 # httpTitle/tlsCN/upnpModel/banner all reuse MAX_FIELD_LEN via clamp().
 MAX_SCRIPT_OUTPUT = 256    # cap per NSE script output
 MAX_SCRIPTS_PER_PORT = 6   # cap on number of scripts recorded per port
+
+# `snapshot` (periodic new-device detection) bounds.
+MAX_NOTIFICATIONS_PER_RUN = 3      # after this many new devices, send one summary instead
+SNAPSHOT_MAX_AGE_DAYS = 30         # prune devices not seen in this long
+NOTIFY_BODY_LEN = 96
 
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -493,12 +500,19 @@ def _discover_devices():
     return iface, gateway, subnet, local_ip, devices_list
 
 
-def scan_network():
-    iface, gateway, subnet, local_ip, devices_list = _discover_devices()
-
+def _attach_aliases(devices_list):
+    """Load the alias store once and stamp each device's "alias" field
+    in place. MAC-less synthetic entries ("self:<ip>") get "" -- their
+    "mac" field is already "" and can't match anything in the store.
+    """
     aliases = load_aliases()
     for d in devices_list:
         d["alias"] = aliases.get(d["mac"], "") if d["mac"] else ""
+
+
+def scan_network():
+    iface, gateway, subnet, local_ip, devices_list = _discover_devices()
+    _attach_aliases(devices_list)
 
     output = {
         "status": "ok",
@@ -510,6 +524,199 @@ def scan_network():
         "devices": devices_list
     }
     emit_json(output)
+
+
+def state_dir():
+    return os.path.join(_xdg_state_home(), "omarchy-netscan")
+
+
+def _path_within(path, base_dir):
+    """True iff the realpath of `path` sits inside the realpath of `base_dir`."""
+    try:
+        rp = os.path.realpath(path)
+        rb = os.path.realpath(base_dir)
+    except OSError:
+        return False
+    return rp == rb or rp.startswith(rb + os.sep)
+
+
+def snapshot_path(network_key):
+    """Map a (already-validated) network key to its snapshot file.
+
+    The key can come from arp-scan's view of the gateway's MAC -- i.e. from
+    a device on the LAN that could try to spoof it -- and it ends up as
+    part of a filename, so the raw key is never interpolated into the
+    path. hashlib.sha256(...).hexdigest()[:16] means the filename is
+    always exactly "snapshot-<16 hex chars>.json" by construction,
+    regardless of what the key contains; the human-readable key itself is
+    stored inside the JSON ("network" field), never in the path.
+    """
+    digest = hashlib.sha256(network_key.encode("utf-8", "replace")).hexdigest()[:16]
+    return os.path.join(state_dir(), f"snapshot-{digest}.json")
+
+
+def _network_key(gateway, devices_list, subnet):
+    """Gateway MAC if we can find one, else the subnet, else "".
+
+    The gateway MAC is what makes this usable on a laptop that roams
+    between networks -- without it, every new Wi-Fi joined would look
+    like a LAN full of "new" devices.
+    """
+    gw_mac = ""
+    for d in devices_list:
+        if d.get("ip") == gateway and d.get("mac"):
+            gw_mac = d["mac"]
+            break
+    if gw_mac:
+        # Already normalized by _discover_devices, but re-validate here too
+        # -- this value is about to become part of a filename (by way of
+        # its hash), and we'd rather abort than trust a MAC-shaped string
+        # we didn't re-check ourselves.
+        return normalize_mac(gw_mac)
+    return clamp(subnet, 64) if subnet else ""
+
+
+def _with_state_lock(path, fn):
+    """Hold an exclusive flock on `path` (creating it if needed) for the
+    duration of fn(). Serializes the timer run against a manual `snapshot`
+    invocation racing it. Best-effort: if we can't even open the lock file,
+    fn() still runs (unlocked) rather than silently doing nothing.
+    """
+    _ensure_dir(os.path.dirname(path))
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return fn()
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _notify_new_devices(new_devices):
+    """notify-send about newly seen devices, capped at
+    MAX_NOTIFICATIONS_PER_RUN individual pop-ups -- past that, one summary.
+    Vendor/IP strings here come from arp-scan's OUI table, i.e. from
+    whatever a device on the LAN claims -- clamp + strip control chars, and
+    pass args after a bare "--" so a vendor string starting with "-" can't
+    be read as a notify-send flag (this is exec'd via argv, never a shell,
+    so there's no command-injection angle either way).
+    """
+    if not new_devices:
+        return
+    notify_bin = shutil.which("notify-send")
+    if not notify_bin:
+        return
+
+    def clean(s):
+        return clamp(_CONTROL_CHARS_RE.sub("", s or ""), NOTIFY_BODY_LEN)
+
+    title = "Nuevo dispositivo en la red"
+
+    if len(new_devices) > MAX_NOTIFICATIONS_PER_RUN:
+        body = clean(f"{len(new_devices)} nuevos dispositivos detectados")
+        run_bounded([notify_bin, "-a", "Network Scanner", "--", title, body], timeout=3)
+        return
+
+    for d in new_devices[:MAX_NOTIFICATIONS_PER_RUN]:
+        label = d.get("vendor") or "Unknown"
+        body = clean(f"{d.get('ip', '')} · {label}")
+        run_bounded([notify_bin, "-a", "Network Scanner", "--", title, body], timeout=3)
+
+
+def snapshot():
+    """Discover devices, diff against the last snapshot for this network,
+    notify about anything new, and persist the merged result. Meant to be
+    run by the systemd timer as well as by hand; safe to run concurrently
+    with itself thanks to _with_state_lock().
+    """
+    iface, gateway, subnet, local_ip, devices_list = _discover_devices()
+    _attach_aliases(devices_list)
+
+    network_key = _network_key(gateway, devices_list, subnet)
+    if not network_key:
+        emit_json({"status": "error", "message": "could not determine a network key"})
+        return
+
+    path = snapshot_path(network_key)
+    if not _path_within(path, state_dir()):
+        emit_json({"status": "error", "message": "refusing to write outside the state directory"})
+        return
+
+    result = {}
+
+    def _do():
+        now = int(time.time())
+        existing = _read_json_safe(path, MAX_CONFIG_BYTES) or {}
+        existing_devices = existing.get("devices")
+        if not isinstance(existing_devices, dict):
+            existing_devices = {}
+
+        known_macs = {normalize_mac(m) for m in existing_devices if normalize_mac(m)}
+
+        merged = {}
+        new_devices = []
+        for d in devices_list:
+            mac = d.get("mac") or ""
+            if not mac:
+                continue  # can't track a MAC-less synthetic "self:" entry across runs
+            label = clamp(d.get("alias") or d.get("vendor") or "", MAX_FIELD_LEN)
+            prior = existing_devices.get(mac)
+            first_seen = now
+            if isinstance(prior, dict) and isinstance(prior.get("firstSeen"), int):
+                first_seen = prior["firstSeen"]
+            merged[mac] = {
+                "firstSeen": first_seen,
+                "lastSeen": now,
+                "lastIp": d["ip"],
+                "vendor": label
+            }
+            if mac not in known_macs:
+                new_devices.append({"ip": d["ip"], "mac": mac, "vendor": label})
+
+        # Carry forward devices not seen this run, pruning anything stale.
+        cutoff = now - SNAPSHOT_MAX_AGE_DAYS * 24 * 3600
+        for mac, info in existing_devices.items():
+            nm = normalize_mac(mac)
+            if not nm or nm in merged or not isinstance(info, dict):
+                continue
+            if isinstance(info.get("lastSeen"), int) and info["lastSeen"] >= cutoff:
+                merged[nm] = info
+
+        if len(merged) > MAX_DEVICES:
+            merged = dict(
+                sorted(merged.items(), key=lambda kv: kv[1].get("lastSeen", 0), reverse=True)[:MAX_DEVICES]
+            )
+
+        ok = _write_json_atomic(path, {
+            "schemaVersion": 1,
+            "network": network_key,
+            "updated": now,
+            "devices": merged
+        })
+        result["ok"] = ok
+        result["new"] = new_devices
+        result["known"] = max(0, len(merged) - len(new_devices))
+
+    _with_state_lock(path, _do)
+
+    if not result.get("ok"):
+        emit_json({"status": "error", "message": "failed to write snapshot"})
+        return
+
+    _notify_new_devices(result["new"])
+    emit_json({"status": "ok", "new": result["new"], "known": result["known"]})
 
 
 def scan_ports(target_ip):
@@ -906,5 +1113,7 @@ if __name__ == "__main__":
     elif sys.argv[1] == "inspect":
         target = sys.argv[2] if len(sys.argv) > 2 else ""
         inspect_host(target)
+    elif sys.argv[1] == "snapshot":
+        snapshot()
     else:
         print(json.dumps({"status": "error", "message": "Unknown command"}))

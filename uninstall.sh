@@ -6,9 +6,15 @@
 #   - the plugin directory   (~/.config/omarchy/plugins/lu15ggtz.netscan/)
 #   - the CLI wrapper        (~/.local/bin/omarchy-netscan)
 #   - the bar widget entry   (~/.config/omarchy/shell.json)
+#   - the systemd --user snapshot timer + unit files
 #
 # It does NOT touch system packages (python3, arp-scan, nmap) or revoke any
 # cap_net_raw capability set on arp-scan, since those may be used elsewhere.
+# It also does NOT delete your aliases or snapshot history
+# (~/.config/omarchy-netscan/, ~/.local/state/omarchy-netscan/) unless you
+# separately confirm that -- those live outside the plugin directory
+# specifically so a reinstall (or this uninstall) doesn't wipe the names
+# you've typed in.
 # ==============================================================================
 
 set -e
@@ -17,6 +23,9 @@ PLUGIN_ID="lu15ggtz.netscan"
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
 CLI_BIN="$HOME/.local/bin/omarchy-netscan"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+NETSCAN_CONFIG_DIR="$HOME/.config/omarchy-netscan"
+NETSCAN_STATE_DIR="$HOME/.local/state/omarchy-netscan"
 
 echo "==> Uninstalling Omarchy Network Scanner..."
 
@@ -36,7 +45,22 @@ else
   echo "   Plugin directory not present, skipping."
 fi
 
-# 3. Remove the bar widget entry from shell.json (if present).
+# 3. Disable + remove the systemd --user snapshot timer, if installed.
+if command -v systemctl &>/dev/null; then
+  if systemctl --user is-enabled omarchy-netscan.timer &>/dev/null || systemctl --user is-active omarchy-netscan.timer &>/dev/null; then
+    systemctl --user disable --now omarchy-netscan.timer 2>/dev/null || true
+    echo "   Disabled the snapshot timer."
+  fi
+fi
+if [ -f "$SYSTEMD_USER_DIR/omarchy-netscan.service" ] || [ -f "$SYSTEMD_USER_DIR/omarchy-netscan.timer" ]; then
+  rm -f "$SYSTEMD_USER_DIR/omarchy-netscan.service" "$SYSTEMD_USER_DIR/omarchy-netscan.timer"
+  command -v systemctl &>/dev/null && systemctl --user daemon-reload 2>/dev/null || true
+  echo "   Removed systemd unit files from $SYSTEMD_USER_DIR."
+else
+  echo "   systemd unit files not present, skipping."
+fi
+
+# 4. Remove the bar widget entry from shell.json (if present).
 # As in install.sh, this uses a helper that opens shell.json with O_NOFOLLOW
 # (refusing a symlinked config) and writes the result atomically via a
 # same-directory temp file + rename, instead of truncating it in place.
@@ -133,7 +157,7 @@ else
   echo "   $SHELL_CONFIG not present, skipping."
 fi
 
-# 4. Optional: revoke cap_net_raw from arp-scan (only if explicitly requested).
+# 5. Optional: revoke cap_net_raw from arp-scan (only if explicitly requested).
 # Resolve to a canonical, symlink-free path first so we never act on a
 # same-named binary shadowing arp-scan elsewhere on $PATH.
 if command -v arp-scan &>/dev/null && command -v getcap &>/dev/null; then
@@ -156,6 +180,27 @@ if command -v arp-scan &>/dev/null && command -v getcap &>/dev/null; then
         ;;
     esac
   fi
+fi
+
+# 6. Optional: delete your aliases and snapshot history. These live outside
+# the plugin directory precisely so a reinstall (or this uninstall) doesn't
+# silently erase names you've typed in -- so this is asked separately from
+# everything above, and defaults to keeping them.
+if [ -d "$NETSCAN_CONFIG_DIR" ] || [ -d "$NETSCAN_STATE_DIR" ]; then
+  echo
+  echo "   Your device aliases and new-device snapshot history are stored at:"
+  [ -d "$NETSCAN_CONFIG_DIR" ] && echo "     $NETSCAN_CONFIG_DIR"
+  [ -d "$NETSCAN_STATE_DIR" ] && echo "     $NETSCAN_STATE_DIR"
+  read -r -p "[?] Delete this data too? [y/N] " ans
+  case "$ans" in
+    [yY]|[yY][eE][sS])
+      rm -rf "$NETSCAN_CONFIG_DIR" "$NETSCAN_STATE_DIR"
+      echo "   Removed aliases and snapshot history."
+      ;;
+    *)
+      echo "   Keeping aliases and snapshot history."
+      ;;
+  esac
 fi
 
 echo "==> Uninstall complete. The Network Scanner widget has been removed from your Omarchy bar."
