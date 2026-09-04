@@ -42,6 +42,11 @@ Panel {
   property int aliasTargetIndex: -1
   property string aliasTargetName: ""
 
+  // On-demand hostname resolution (DNS/mDNS), indexed by IP so results
+  // survive navigating away and back without re-querying.
+  property var hostnameCache: ({})
+  property string identifyBuffer: ""
+
   // Buffers for Process output
   property string scanBuffer: ""
   property string nmapBuffer: ""
@@ -87,6 +92,10 @@ Panel {
     portScanDone = false
     currentPorts = []
     renaming = false
+    // Restarted on every navigation step -- identifyProc only actually
+    // fires once the user stops moving for 400ms, so tapping through j/k
+    // never spawns a resolver per hop.
+    identifyDebounce.restart()
   }
 
   function startRename() {
@@ -218,6 +227,43 @@ Panel {
       }
       root.aliasBuffer = ""
       root.aliasTargetIndex = -1
+    }
+  }
+
+  Timer {
+    id: identifyDebounce
+    interval: 400
+    repeat: false
+    onTriggered: {
+      var ip = root.selectedIp
+      if (!ip || root.hostnameCache.hasOwnProperty(ip) || identifyProc.running) return
+      root.identifyBuffer = ""
+      identifyProc.command = [root.enginePath, "identify", ip]
+      identifyProc.running = true
+    }
+  }
+
+  Process {
+    id: identifyProc
+    stdout: SplitParser {
+      onRead: function(data) {
+        root.identifyBuffer += data
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && root.identifyBuffer.length > 0) {
+        try {
+          var res = JSON.parse(root.identifyBuffer)
+          if (res.status === "ok" && res.ip) {
+            var updated = Object.assign({}, root.hostnameCache)
+            updated[res.ip] = { hostname: res.hostname || "", source: res.source || "" }
+            root.hostnameCache = updated
+          }
+        } catch (e) {
+          console.log("[netscan] Error parsing identify JSON:", e)
+        }
+      }
+      root.identifyBuffer = ""
     }
   }
 
@@ -763,6 +809,32 @@ Panel {
                   Text {
                     text: root.selectedDevice ? root.selectedDevice.category : ""
                     color: root.accentColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                  }
+                }
+
+                // Host row -- on-demand DNS/mDNS hostname, shown once identifyProc
+                // resolves something for the selected IP (visible only then).
+                RowLayout {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  readonly property var entry: root.selectedIp ? root.hostnameCache[root.selectedIp] : undefined
+                  visible: !!(entry && entry.hostname)
+
+                  Text {
+                    text: "Host:"
+                    color: Qt.darker(root.foreground, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    text: parent.entry ? (parent.entry.hostname + " (" + parent.entry.source + ")") : ""
+                    color: Qt.darker(root.foreground, 1.2)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     Layout.fillWidth: true

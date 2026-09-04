@@ -36,6 +36,7 @@ MAX_CONFIG_BYTES = 128 * 1024      # cap on aliases.json / snapshot file size we
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _IFACE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+_IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
 
 def normalize_mac(s):
@@ -564,6 +565,71 @@ def scan_ports(target_ip):
     })
 
 
+def _clean_hostname(h, ip):
+    """Bound and sanity-check a hostname pulled from a DNS/mDNS resolver.
+
+    The resolver answering is just another device on the network, so a
+    hostname is exactly the kind of untrusted, attacker-shapeable string
+    the reviewer asked to bound: clamp its length, strip control chars,
+    and reject anything that isn't a plausible single hostname token
+    (internal whitespace, or simply the IP echoed back).
+    """
+    if not h:
+        return ""
+    h = _CONTROL_CHARS_RE.sub("", h).strip()
+    if not h or h == ip:
+        return ""
+    if re.search(r"\s", h):
+        return ""
+    return clamp(h, 96)
+
+
+def identify_host(ip):
+    """Best-effort reverse-resolve `ip` to a hostname via DNS then mDNS.
+
+    Deliberately NOT part of scan_network() -- it's a per-host, on-demand
+    lookup the UI debounces, so it never costs the fast general scan its
+    ~1-2s budget.
+    """
+    if not ip or not _IP_RE.match(ip):
+        emit_json({"status": "error", "message": "Invalid target IP"})
+        return
+
+    hostname = ""
+    source = ""
+
+    getent_bin = shutil.which("getent")
+    if getent_bin:
+        try:
+            raw, _, _ = run_bounded([getent_bin, "hosts", ip], timeout=2, max_bytes=8 * 1024)
+            out = raw.decode("utf-8", "replace").strip()
+            if out:
+                fields = out.splitlines()[0].split()
+                if len(fields) >= 2:
+                    candidate = _clean_hostname(fields[1], ip)
+                    if candidate:
+                        hostname, source = candidate, "dns"
+        except Exception:
+            pass
+
+    if not hostname:
+        avahi_bin = shutil.which("avahi-resolve-address")
+        if avahi_bin:
+            try:
+                raw, _, _ = run_bounded([avahi_bin, ip], timeout=2, max_bytes=8 * 1024)
+                out = raw.decode("utf-8", "replace").strip()
+                if out:
+                    fields = out.splitlines()[0].split(None, 1)
+                    if len(fields) >= 2:
+                        candidate = _clean_hostname(fields[1], ip)
+                        if candidate:
+                            hostname, source = candidate, "mdns"
+            except Exception:
+                pass
+
+    emit_json({"status": "ok", "ip": ip, "hostname": hostname, "source": source})
+
+
 def cmd_alias(args):
     """Dispatch `alias list|set|rm ...`. Always prints JSON, never free text."""
     if not args:
@@ -629,5 +695,8 @@ if __name__ == "__main__":
         scan_ports(target)
     elif sys.argv[1] == "alias":
         cmd_alias(sys.argv[2:])
+    elif sys.argv[1] == "identify":
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
+        identify_host(target)
     else:
         print(json.dumps({"status": "error", "message": "Unknown command"}))
