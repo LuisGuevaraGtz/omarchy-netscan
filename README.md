@@ -35,10 +35,23 @@ The Network Scanner widget lives right on your Omarchy top bar and opens a nativ
 
 ## 📦 Requirements
 
-The plugin relies on standard, unprivileged network utilities available in Arch Linux / Omarchy:
+The plugin relies on standard, unprivileged network utilities:
+
+- **`python3`** — required: the scanning engine is a Python 3 script.
+- **`arp-scan`** — recommended: fast raw-packet discovery with vendor OUI.
+  Without it the panel falls back to the kernel neighbor table (fewer
+  devices, no vendor names).
+- **`nmap`** — required only for the per-host port / deep scans; without it
+  those buttons report "nmap binary not found" instead of scanning.
+- **`wl-copy`** — for the Copy-IP button (Wayland clipboard).
+- **`notify-send`** — only used by the optional periodic watch timer.
+
+Install them with your system package manager, e.g.:
 
 ```bash
-sudo pacman -S arp-scan nmap python
+sudo pacman -S arp-scan nmap python      # Arch / Omarchy
+sudo apt install arp-scan nmap python3   # Debian / Ubuntu
+sudo dnf install arp-scan nmap python3   # Fedora
 ```
 
 > **Note**: To allow `arp-scan` to perform raw socket scanning without prompting for `sudo`, you may grant it the `cap_net_raw` capability (optional):
@@ -51,7 +64,10 @@ sudo pacman -S arp-scan nmap python
 > `/usr/bin/arp-scan` — canonical path (no `$PATH`-shadowing), root-owned,
 > not group/other-writable, and confirmed by `pacman` to both belong to the
 > `arp-scan` package and pass its file-integrity check. Any failure aborts
-> the step; it never falls back to trusting a bare `which arp-scan` hit.
+> the step; it never falls back to trusting a bare `which arp-scan` hit. On
+> distros without `pacman` the provenance check can't run, so the `setcap`
+> step is skipped entirely rather than weakened — the plugin still works
+> without it.
 
 ---
 
@@ -65,14 +81,16 @@ omarchy plugin add https://github.com/LuisGuevaraGtz/omarchy-netscan.git
 
 ### Method 2: Manual Installation
 
-1. Clone this repository into your Omarchy plugins folder:
+1. Clone this repository into your Omarchy plugins folder (`$XDG_CONFIG_HOME`
+   is honored by both `install.sh` and `uninstall.sh`; the default is
+   `~/.config`):
 ```bash
-git clone https://github.com/LuisGuevaraGtz/omarchy-netscan.git ~/.config/omarchy/plugins/lu15ggtz.netscan
+git clone https://github.com/LuisGuevaraGtz/omarchy-netscan.git "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/lu15ggtz.netscan"
 ```
 
 2. Run the automated setup script:
 ```bash
-cd ~/.config/omarchy/plugins/lu15ggtz.netscan
+cd "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/lu15ggtz.netscan"
 ./install.sh
 ```
 
@@ -100,6 +118,43 @@ omarchy plugin enable lu15ggtz.netscan
 ```
 
 Once enabled, Omarchy's shell detects the plugin and renders the `󰛳` icon on your top bar.
+
+> **Portability**: nothing that runs the plugin is distro-specific. `install.sh`
+> only hard-requires `python3`; missing `arp-scan`/`nmap` produce a warning (not
+> an abort) and the engine degrades gracefully. The CLI wrapper and the
+> systemd watch-timer unit are generated from the resolved plugin path, so a
+> non-standard `$XDG_CONFIG_HOME` keeps working.
+
+---
+
+## ⚙️ Settings
+
+The widget reads per-instance settings from its `shell.json` bar entry
+(`panelWidth`), tunable from Omarchy's widget settings:
+
+| Key | Type | Default | Range | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `panelWidth` | integer | 430 | 320–720 | Width of the scanner popup, in px. |
+
+The value is clamped in QML between 320 and 720, so a hand-edited value can't
+produce a degenerate panel.
+
+---
+
+## 🧪 Testing
+
+The engine ships an offline unit-test suite (fictional data only — no
+`arp-scan`, `nmap`, or network access required):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+This covers MAC/alias sanitization, device classification, bounded subprocess
+handling (timeout + output truncation), `arp-scan`/neighbor-table parsing,
+fast/deep nmap result parsing, DNS/mDNS hostname resolution, and the snapshot
+new-device diff (first run, no-change, new device, stale-device pruning).
+A GitHub Actions workflow runs the same suite on every push/PR.
 
 ---
 
@@ -302,11 +357,25 @@ omarchy-netscan --watch status
 
 ## 🚀 Publishing to omarchyplugins.com
 
-This repository contains a valid `manifest.json` adhering to `schemaVersion: 1`. To submit and publish this plugin to the community directory at [omarchyplugins.com](https://omarchyplugins.com):
+This repository contains a valid `manifest.json` adhering to `schemaVersion: 1`,
+a root README with install/remove instructions, and a root MIT license. To
+submit and publish this plugin to the community directory at
+[omarchyplugins.com](https://omarchyplugins.com):
 
 1. Push your repository to GitHub: `https://github.com/LuisGuevaraGtz/omarchy-netscan`.
-2. Visit [omarchyplugins.com](https://omarchyplugins.com) and submit your repository URL, or submit a pull request to the Omarchy Plugins directory index repository.
-3. The catalog will automatically parse `manifest.json`, the description, and the `bar-widget` entry points.
+2. Open a submission issue on the Omarchy plugin marketplace repository
+   (`HANCORE-linux/omarchy-plugin-marketplace`) with the title
+   `[Plugin]: Network Scanner`.
+3. The automated pipeline validates the manifest, checks the entry points, and
+   runs a static exact-commit security baseline against the repository before a
+   maintainer's `approved-and-verified` decision.
+4. Suggested listing values: category **System**, tags **bar**, **quickshell**,
+   **security**.
+
+Any later push creates a new commit that is no longer covered by the verified
+snapshot until a full-SHA update request is approved — so bump the manifest
+`version` and retest locally (see [Testing](#-testing)) before tagging a
+release.
 
 ---
 

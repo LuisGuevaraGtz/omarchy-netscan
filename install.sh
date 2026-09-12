@@ -1,30 +1,63 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Omarchy Network Scanner - Installation Script
+#
+# Path-aware and distro-agnostic:
+#   * Honors $XDG_CONFIG_HOME instead of assuming ~/.config, and every artifact
+#     it writes (CLI wrapper, systemd unit) is generated from the resolved
+#     plugin path -- so the watch timer keeps working no matter where the user
+#     keeps their Omarchy config.
+#   * Never fails hard on missing optional tools. python3 is the only hard
+#     requirement; without arp-scan the engine falls back to the kernel
+#     neighbor table, and without nmap the port-scan buttons report it
+#     cleanly. This keeps non-Arch users unblocked.
+#   * Every privileged or persistent change (cap_net_raw on arp-scan, the
+#     systemd --user timer, the shell.json bar entry) stays opt-in and asks
+#     for explicit confirmation before doing anything.
 # ==============================================================================
 
 set -e
 
 PLUGIN_ID="lu15ggtz.netscan"
-PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+OMARCHY_CONFIG="$XDG_CONFIG_HOME/omarchy"
+PLUGIN_DIR="$OMARCHY_CONFIG/plugins/$PLUGIN_ID"
+SHELL_CONFIG="$OMARCHY_CONFIG/shell.json"
+CLI_DIR="$HOME/.local/bin"
+SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
 
 echo "==> Installing Omarchy Network Scanner..."
+echo "    Plugin dir : $PLUGIN_DIR"
+echo "    Shell conf : $SHELL_CONFIG"
+echo "    CLI wrapper: $CLI_DIR/omarchy-netscan"
 
-# 1. Check system dependencies
+# 1. Check system dependencies (advisory except for python3).
 echo "==> Checking dependencies..."
+if ! command -v python3 &>/dev/null; then
+  echo "[!] python3 is required (the engine is a Python script)."
+  echo "    Install it with your system package manager and re-run this script."
+  exit 1
+fi
+
 MISSING_DEPS=()
-for dep in python3 arp-scan nmap; do
+for dep in arp-scan nmap; do
   if ! command -v "$dep" &>/dev/null; then
     MISSING_DEPS+=("$dep")
   fi
 done
 
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
-  echo "[!] Missing required tools: ${MISSING_DEPS[*]}"
-  echo "    Please install them on Arch/Omarchy via:"
-  echo "    sudo pacman -S ${MISSING_DEPS[*]}"
-  exit 1
+  echo "[!] Optional tools not found: ${MISSING_DEPS[*]}"
+  echo "    Install them with your system package manager to unlock their feature:"
+  echo "      Arch/Omarchy:  sudo pacman -S ${MISSING_DEPS[*]}"
+  echo "      Debian/Ubuntu: sudo apt install ${MISSING_DEPS[*]}"
+  echo "      Fedora:        sudo dnf install ${MISSING_DEPS[*]}"
+  echo
+  echo "    Without them the plugin still works, with reduced scope:"
+  echo "      - arp-scan: misses out on fast raw-packet scanning and vendor OUI;"
+  echo "                  the panel uses the kernel neighbor table instead."
+  echo "      - nmap:     the 'Scan' and 'Deep' buttons report 'nmap binary not"
+  echo "                  found' instead of probing ports."
 fi
 
 # Optional: grant arp-scan raw packet capabilities for unprivileged scanning.
@@ -33,7 +66,9 @@ fi
 # the real, unmodified, pacman-owned /usr/bin/arp-scan -- never merely
 # whatever "arp-scan" happens to resolve to first on $PATH. If skipped, the
 # plugin falls back to running arp-scan with whatever privileges are
-# available (and README documents an alternative).
+# available (and README documents an alternative). On distros without pacman
+# the provenance check cannot be performed, so the step is skipped entirely
+# rather than weakening the check.
 #
 # Verification performed before ever calling `sudo setcap`, in order:
 #   1. Resolve the PATH hit to its canonical, symlink-free real path.
@@ -125,20 +160,24 @@ try_setcap_arpscan
 
 # 2. Create plugin destination directory
 mkdir -p "$PLUGIN_DIR"
-mkdir -p "$HOME/.local/bin"
+mkdir -p "$CLI_DIR"
 
-# 3. Copy plugin files
+# 3. Copy plugin files (never the interpreter's bytecode cache).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp -r "$SCRIPT_DIR/manifest.json" "$PLUGIN_DIR/"
 cp -r "$SCRIPT_DIR/Panel.qml" "$PLUGIN_DIR/"
 cp -r "$SCRIPT_DIR/bin" "$PLUGIN_DIR/"
+rm -rf "$PLUGIN_DIR/bin/__pycache__"
 chmod +x "$PLUGIN_DIR/bin/netscan-engine"
 
-# 4. Install CLI trigger wrapper
-cat << 'EOF' > "$HOME/.local/bin/omarchy-netscan"
+# 4. Install CLI trigger wrapper. Generated from the resolved plugin path so
+#    it keeps working when $XDG_CONFIG_HOME points somewhere non-standard.
+#    @PLUGIN_ID@ / @ENGINE@ are substituted below; every other '$' is written
+#    literally for the wrapper's own runtime use.
+cat << 'WRAPPER_EOF' > "$CLI_DIR/omarchy-netscan"
 #!/usr/bin/env bash
-PLUGIN_ID="lu15ggtz.netscan"
-ENGINE="$HOME/.config/omarchy/plugins/lu15ggtz.netscan/bin/netscan-engine"
+PLUGIN_ID="@PLUGIN_ID@"
+ENGINE="@ENGINE@"
 
 if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
   echo "Omarchy Network Scanner"
@@ -201,17 +240,54 @@ if command -v omarchy-shell &>/dev/null; then
 else
   python3 "$ENGINE" scan | python3 -m json.tool
 fi
-EOF
-chmod +x "$HOME/.local/bin/omarchy-netscan"
+WRAPPER_EOF
+sed -i -e "s|@PLUGIN_ID@|$PLUGIN_ID|g" -e "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|g" "$CLI_DIR/omarchy-netscan"
+chmod +x "$CLI_DIR/omarchy-netscan"
 
 # 5. Install the (opt-in) systemd --user units for periodic snapshots /
-# new-device notifications. Installing the unit files is harmless on its
-# own -- nothing runs until the timer is enabled, which we only do with
-# explicit confirmation, same as setcap and shell.json above. Default: no.
-SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+# new-device notifications. Units are generated from the resolved plugin
+# path (rather than shipped as static files) so the timer finds the engine
+# even when $XDG_CONFIG_HOME is non-standard. Installing the unit files is
+# harmless on its own -- nothing runs until the timer is enabled, which we
+# only do with explicit confirmation, same as setcap and shell.json above.
+# Default: no.
 mkdir -p "$SYSTEMD_USER_DIR"
-cp "$SCRIPT_DIR/systemd/omarchy-netscan.service" "$SYSTEMD_USER_DIR/"
-cp "$SCRIPT_DIR/systemd/omarchy-netscan.timer" "$SYSTEMD_USER_DIR/"
+
+cat << 'SERVICE_EOF' > "$SYSTEMD_USER_DIR/omarchy-netscan.service"
+[Unit]
+Description=Omarchy netscan snapshot
+
+[Service]
+Type=oneshot
+ExecStart=@ENGINE@ snapshot
+PrivateTmp=yes
+
+# Deliberately NOT setting NoNewPrivileges=yes: it would block file
+# capabilities from taking effect, and arp-scan needs its cap_net_raw+p
+# (granted, opt-in, by install.sh -- see there for the verification that
+# precedes it) to do an unprivileged raw-packet scan. This unit runs as
+# the user, does exactly the same bounded work
+# (run_bounded()/killpg/clamp()-everything, see bin/netscan-engine) as the
+# interactive plugin, and the one capability involved lives on arp-scan's
+# binary, not on this unit or this service -- NoNewPrivileges=yes would add
+# no real security margin here, it would just silently turn the scan into
+# an empty result every time the timer fires.
+SERVICE_EOF
+sed -i "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|" "$SYSTEMD_USER_DIR/omarchy-netscan.service"
+
+cat << 'TIMER_EOF' > "$SYSTEMD_USER_DIR/omarchy-netscan.timer"
+[Unit]
+Description=Periodic Omarchy netscan snapshot
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
 
 if command -v systemctl &>/dev/null; then
   systemctl --user daemon-reload 2>/dev/null || true

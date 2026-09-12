@@ -17,6 +17,11 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string enginePath: Qt.resolvedUrl("bin/netscan-engine").toString().replace(/^file:\/\//, "")
 
+  // User-tunable from the widget's shell.json entry (manifest
+  // barWidget.defaults/schema). Clamped so a hand-edited value can't
+  // produce a degenerate panel.
+  readonly property int panelWidth: Math.max(320, Math.min(720, setting("panelWidth", 430)))
+
   // Network state
   property string iface: ""
   property string subnet: ""
@@ -413,7 +418,7 @@ Panel {
     owner: root
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(430))
+    contentWidth: popup.fittedContentWidth(Style.space(root.panelWidth))
     contentHeight: popup.fittedContentHeight(mainColumn.implicitHeight)
 
     PanelKeyCatcher {
@@ -856,7 +861,7 @@ Panel {
                   }
 
                   Text {
-                    text: (root.selectedDevice && root.selectedDevice.alias) ? root.selectedDevice.alias : "— sin nombre —"
+                    text: (root.selectedDevice && root.selectedDevice.alias) ? root.selectedDevice.alias : "— unnamed —"
                     color: (root.selectedDevice && root.selectedDevice.alias) ? root.foreground : Qt.darker(root.foreground, 1.6)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption

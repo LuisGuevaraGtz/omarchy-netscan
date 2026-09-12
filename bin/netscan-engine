@@ -622,10 +622,10 @@ def _notify_new_devices(new_devices):
     def clean(s):
         return clamp(_CONTROL_CHARS_RE.sub("", s or ""), NOTIFY_BODY_LEN)
 
-    title = "Nuevo dispositivo en la red"
+    title = "New device on your network"
 
     if len(new_devices) > MAX_NOTIFICATIONS_PER_RUN:
-        body = clean(f"{len(new_devices)} nuevos dispositivos detectados")
+        body = clean(f"{len(new_devices)} new devices detected")
         run_bounded([notify_bin, "-a", "Network Scanner", "--", title, body], timeout=3)
         return
 

@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Engine compiles
+        run: python3 -m py_compile bin/netscan-engine
+
+      - name: Unit tests (offline, fictional data)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: manifest.json is valid JSON
+        run: python3 -m json.tool manifest.json >/dev/null
+
+      - name: install.sh / uninstall.sh syntax
+        run: bash -n install.sh && bash -n uninstall.sh

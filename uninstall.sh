@@ -20,12 +20,14 @@
 set -e
 
 PLUGIN_ID="lu15ggtz.netscan"
-PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+OMARCHY_CONFIG="$XDG_CONFIG_HOME/omarchy"
+PLUGIN_DIR="$OMARCHY_CONFIG/plugins/$PLUGIN_ID"
+SHELL_CONFIG="$OMARCHY_CONFIG/shell.json"
 CLI_BIN="$HOME/.local/bin/omarchy-netscan"
-SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-NETSCAN_CONFIG_DIR="$HOME/.config/omarchy-netscan"
-NETSCAN_STATE_DIR="$HOME/.local/state/omarchy-netscan"
+SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
+NETSCAN_CONFIG_DIR="$XDG_CONFIG_HOME/omarchy-netscan"
+NETSCAN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-netscan"
 
 echo "==> Uninstalling Omarchy Network Scanner..."
 

@@ -3,7 +3,10 @@ Description=Omarchy netscan snapshot
 
 [Service]
 Type=oneshot
-ExecStart=%h/.config/omarchy/plugins/lu15ggtz.netscan/bin/netscan-engine snapshot
+# @ENGINE@ is substituted by install.sh with the resolved plugin path
+# (bin/netscan-engine inside ~/.config/omarchy/plugins/lu15ggtz.netscan).
+# install.sh writes this file to ~/.config/systemd/user/ with the real path.
+ExecStart=@ENGINE@ snapshot
 PrivateTmp=yes
 
 # Deliberately NOT setting NoNewPrivileges=yes: it would block file
