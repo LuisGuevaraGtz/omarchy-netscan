@@ -51,6 +51,15 @@ class TmpXdgMixin:
     def engine(self):
         return load_engine()
 
+    def _with_nmap(self, e):
+        """Report nmap as installed so run_bounded stubs get exercised.
+
+        Without this, scan_ports/inspect_host bail out early with
+        'nmap binary not found' on hosts (like CI runners) where nmap
+        is absent — testing the wrong branch while passing locally
+        wherever nmap happens to be installed."""
+        return mock.patch.object(e.shutil, "which", return_value="/usr/bin/nmap")
+
 
 class TestSanitization(TmpXdgMixin, unittest.TestCase):
     def test_normalize_mac(self):
@@ -174,7 +183,7 @@ Nmap done: 1 IP address (1 host up) scanned in 0.89 seconds
 
     def test_parses_top_ports(self):
         e = self.engine()
-        with mock.patch.object(e, "run_bounded", return_value=(self.NMAP_TOP_FIXTURE.encode(), False, False)):
+        with self._with_nmap(e), mock.patch.object(e, "run_bounded", return_value=(self.NMAP_TOP_FIXTURE.encode(), False, False)):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 e.scan_ports("10.0.0.5")
@@ -235,7 +244,7 @@ class TestInspectParsing(TmpXdgMixin, unittest.TestCase):
 
     def test_parses_deep_scan(self):
         e = self.engine()
-        with mock.patch.object(e, "run_bounded", return_value=(self.NMAP_XML_FIXTURE.encode(), False, False)):
+        with self._with_nmap(e), mock.patch.object(e, "run_bounded", return_value=(self.NMAP_XML_FIXTURE.encode(), False, False)):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 e.inspect_host("10.0.0.5")
@@ -252,7 +261,7 @@ class TestInspectParsing(TmpXdgMixin, unittest.TestCase):
         e = self.engine()
         xml = b"""<?xml version="1.0"?><nmaprun><host timedout="true">
           <status state="up"/><times srtt="123456"/><ports/></host></nmaprun>"""
-        with mock.patch.object(e, "run_bounded", return_value=(xml, False, False)):
+        with self._with_nmap(e), mock.patch.object(e, "run_bounded", return_value=(xml, False, False)):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 e.inspect_host("10.0.0.5")
@@ -260,7 +269,7 @@ class TestInspectParsing(TmpXdgMixin, unittest.TestCase):
 
     def test_truncated_output_reports_error(self):
         e = self.engine()
-        with mock.patch.object(e, "run_bounded", return_value=(b"partial", True, False)):
+        with self._with_nmap(e), mock.patch.object(e, "run_bounded", return_value=(b"partial", True, False)):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 e.inspect_host("10.0.0.5")
