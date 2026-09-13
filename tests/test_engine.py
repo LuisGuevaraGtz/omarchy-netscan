@@ -56,9 +56,16 @@ class TmpXdgMixin:
 
         Without this, scan_ports/inspect_host bail out early with
         'nmap binary not found' on hosts (like CI runners) where nmap
-        is absent — testing the wrong branch while passing locally
+        is absent -- testing the wrong branch while passing locally
         wherever nmap happens to be installed."""
-        return mock.patch.object(e.shutil, "which", return_value="/usr/bin/nmap")
+        return mock.patch.object(
+            e, "_trusted_bin", side_effect=lambda n: "/usr/bin/nmap" if n == "nmap" else None
+        )
+
+    def _with_bins(self, e, mapping):
+        """Stub trusted-helper resolution: names in `mapping` resolve to
+        the given absolute paths, everything else is 'not installed'."""
+        return mock.patch.object(e, "_trusted_bin", side_effect=lambda n: mapping.get(n))
 
 
 class TestSanitization(TmpXdgMixin, unittest.TestCase):
@@ -204,7 +211,7 @@ Nmap done: 1 IP address (1 host up) scanned in 0.89 seconds
 
     def test_reports_missing_nmap(self):
         e = self.engine()
-        with mock.patch.object(e.shutil, "which", return_value=None):
+        with mock.patch.object(e, "_trusted_bin", return_value=None):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 e.scan_ports("10.0.0.5")
@@ -281,8 +288,8 @@ class TestIdentifyHost(TmpXdgMixin, unittest.TestCase):
         """Force both resolver branches to be found so run_bounded stubs
         actually get exercised (getent/avahi may be absent on the host)."""
         return mock.patch.object(
-            e.shutil,
-            "which",
+            e,
+            "_trusted_bin",
             side_effect=lambda n: {
                 "getent": "/usr/bin/getent",
                 "avahi-resolve-address": "/usr/bin/avahi-resolve-address",
@@ -439,7 +446,7 @@ default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.2 metric 100
                 return self.NEIGH_FIXTURE.encode(), False, False
             return b"", False, False
 
-        with mock.patch.object(e.shutil, "which", return_value="/usr/bin/arp-scan"), \
+        with self._with_bins(e, {"arp-scan": "/usr/bin/arp-scan", "ip": "/usr/bin/ip"}), \
              mock.patch.object(e, "run_bounded", side_effect=fake_run), \
              mock.patch.object(e, "_read_local_mac", return_value="de:ad:be:ef:00:11"):
             buf = io.StringIO()
@@ -467,7 +474,7 @@ default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.2 metric 100
                 return self.NEIGH_FIXTURE.encode(), False, False
             return b"", False, False
 
-        with mock.patch.object(e.shutil, "which", return_value=None), \
+        with self._with_bins(e, {"ip": "/usr/bin/ip"}), \
              mock.patch.object(e, "run_bounded", side_effect=fake_run), \
              mock.patch.object(e, "_read_local_mac", return_value="de:ad:be:ef:00:11"):
             buf = io.StringIO()
@@ -476,6 +483,159 @@ default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.2 metric 100
         res = json.loads(buf.getvalue())
         self.assertEqual(res["status"], "ok")
         self.assertIn("10.0.0.9", [d["ip"] for d in res["devices"]])
+
+
+class TestTrustedBin(TmpXdgMixin, unittest.TestCase):
+    def test_missing_binary_resolves_none(self):
+        e = self.engine()
+        self.assertIsNone(e._trusted_bin("definitely-not-a-real-binary-xyz"))
+
+    def test_name_with_slash_is_rejected(self):
+        e = self.engine()
+        self.assertIsNone(e._trusted_bin("../bin/sh"))
+        self.assertIsNone(e._trusted_bin("/usr/bin/sh"))
+
+    def test_system_shell_resolves_to_trusted_path(self):
+        # End-to-end acceptance with zero mocking: /bin/sh exists on any
+        # normal Linux, is root-owned, and is not group/world-writable.
+        e = self.engine()
+        found = e._trusted_bin("sh")
+        self.assertIsNotNone(found)
+        self.assertTrue(os.path.isabs(found))
+        self.assertIn(os.path.realpath(os.path.dirname(found)),
+                      {os.path.realpath(d) for d in e._TRUSTED_BIN_DIRS})
+
+    def test_symlink_to_trusted_binary_is_accepted(self):
+        e = self.engine()
+        target = e._trusted_bin("sh")
+        if target is None:
+            self.skipTest("no trusted sh on this host")
+        link = os.path.join(tempfile.mkdtemp(prefix="netscan-link-"), "sh")
+        os.symlink(target, link)
+        self.assertTrue(e._is_trusted_exec(link))
+
+    def test_symlink_escape_is_rejected(self):
+        e = self.engine()
+        d = tempfile.mkdtemp(prefix="netscan-escape-")
+        target = os.path.join(d, "victim")
+        with open(target, "w") as f:
+            f.write("x")
+        os.chmod(target, 0o755)
+        link = os.path.join(d, "link")
+        os.symlink(target, link)
+        self.assertFalse(e._is_trusted_exec(link))
+
+    def test_group_writable_file_is_rejected(self):
+        e = self.engine()
+        fd, path = tempfile.mkstemp(prefix="netscan-gw-")
+        os.close(fd)
+        os.chmod(path, 0o775)
+        self.assertFalse(e._is_trusted_exec(path))
+
+    def test_directory_and_missing_paths_are_rejected(self):
+        e = self.engine()
+        self.assertFalse(e._is_trusted_exec(tempfile.mkdtemp(prefix="netscan-dir-")))
+        self.assertFalse(e._is_trusted_exec("/no/such/path/anywhere-xyz"))
+
+
+class TestSanitizeEnv(TmpXdgMixin, unittest.TestCase):
+    def test_drops_interpreter_startup_vars(self):
+        e = self.engine()
+        with mock.patch.dict(os.environ, {
+            "PYTHONPATH": "/tmp/evil",
+            "PYTHONHOME": "/tmp/evilhome",
+            "PYTHONSTARTUP": "/tmp/evil/startup.py",
+            "HOME": "/home/tester",
+            "XDG_CONFIG_HOME": "/tmp/conf",
+        }, clear=False):
+            e._sanitize_env()
+            self.assertNotIn("PYTHONPATH", os.environ)
+            self.assertNotIn("PYTHONHOME", os.environ)
+            self.assertNotIn("PYTHONSTARTUP", os.environ)
+            self.assertEqual(os.environ["HOME"], "/home/tester")
+            self.assertEqual(os.environ["XDG_CONFIG_HOME"], "/tmp/conf")
+            self.assertEqual(os.environ["LC_ALL"], "C")
+            self.assertTrue(os.environ["PATH"])
+
+    def test_empty_path_gets_trusted_default_but_set_path_is_kept(self):
+        e = self.engine()
+        with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+            e._sanitize_env()
+            self.assertEqual(os.environ["PATH"], e._TRUSTED_PATH)
+        with mock.patch.dict(os.environ, {"PATH": "/custom/bin"}, clear=False):
+            e._sanitize_env()
+            self.assertEqual(os.environ["PATH"], "/custom/bin")
+
+
+class TestCopyCommand(TmpXdgMixin, unittest.TestCase):
+    def _run_copy(self, e, target):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            e.cmd_copy([target] if target is not None else [])
+        return json.loads(buf.getvalue())
+
+    def test_rejects_non_ip_target(self):
+        e = self.engine()
+        for bad in (None, "", "not-an-ip", "10.0.0.5; rm -rf ~", "-h", "router.home"):
+            res = self._run_copy(e, bad)
+            self.assertEqual(res["status"], "error", bad)
+
+    def test_reports_missing_wl_copy(self):
+        e = self.engine()
+        with mock.patch.object(e, "_trusted_bin", return_value=None):
+            res = self._run_copy(e, "10.0.0.5")
+        self.assertEqual(res["status"], "error")
+
+    def test_copies_valid_ip_through_trusted_binary(self):
+        e = self.engine()
+        seen = []
+
+        def fake_run(cmd, timeout, max_bytes):
+            seen.append(cmd)
+            return b"", False, False
+
+        with mock.patch.object(e, "_trusted_bin", return_value="/usr/bin/wl-copy"), \
+             mock.patch.object(e, "run_bounded", side_effect=fake_run):
+            res = self._run_copy(e, "10.0.0.5")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(seen, [["/usr/bin/wl-copy", "--", "10.0.0.5"]])
+
+
+class TestOpenCommand(TmpXdgMixin, unittest.TestCase):
+    def _run_open(self, e, url):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            e.cmd_open([url] if url is not None else [])
+        return json.loads(buf.getvalue())
+
+    def test_rejects_non_device_urls(self):
+        e = self.engine()
+        for bad in (None, "", "file:///etc/passwd", "javascript:alert(1)",
+                    "data:text/html,<b>x</b>", "http://router.home/",
+                    "https://example.com:443/", "ftp://10.0.0.5/",
+                    "--help", "http://10.0.0.5:99999999999999999999/"):
+            res = self._run_open(e, bad)
+            self.assertEqual(res["status"], "error", bad)
+
+    def test_reports_missing_xdg_open(self):
+        e = self.engine()
+        with mock.patch.object(e, "_trusted_bin", return_value=None):
+            res = self._run_open(e, "http://10.0.0.5/")
+        self.assertEqual(res["status"], "error")
+
+    def test_opens_valid_device_url_through_trusted_binary(self):
+        e = self.engine()
+        seen = []
+
+        def fake_run(cmd, timeout, max_bytes):
+            seen.append(cmd)
+            return b"", False, False
+
+        with mock.patch.object(e, "_trusted_bin", return_value="/usr/bin/xdg-open"), \
+             mock.patch.object(e, "run_bounded", side_effect=fake_run):
+            res = self._run_open(e, "https://10.0.0.5:443/")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(seen, [["/usr/bin/xdg-open", "https://10.0.0.5:443/"]])
 
 
 if __name__ == "__main__":

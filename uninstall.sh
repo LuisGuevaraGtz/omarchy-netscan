@@ -29,6 +29,19 @@ SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
 NETSCAN_CONFIG_DIR="$XDG_CONFIG_HOME/omarchy-netscan"
 NETSCAN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-netscan"
 
+# The embedded shell.json JSON helper below is executed with a verified
+# absolute interpreter (same trust bar as install.sh's @PYTHON@: absolute
+# path in a distro-managed bin dir, root-owned regular executable file),
+# never a PATH-resolved `python3`.
+PYTHON_BIN="$(realpath "$(command -v python3)" 2>/dev/null)" || PYTHON_BIN=""
+case "$PYTHON_BIN" in
+  /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*) ;;
+  *) PYTHON_BIN="";;
+esac
+if [ -z "$PYTHON_BIN" ] || [ ! -f "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ] || [ -n "$(find "$PYTHON_BIN" -maxdepth 0 \( -not -uid 0 -or -perm /022 \) 2>/dev/null)" ]; then
+  PYTHON_BIN=""
+fi
+
 echo "==> Uninstalling Omarchy Network Scanner..."
 
 # 1. Remove the CLI wrapper
@@ -149,7 +162,11 @@ except Exception:
     raise
 print("   Widget entry removed.")
 PYEOF
-    python3 "$JSON_HELPER" "$SHELL_CONFIG" "$PLUGIN_ID" remove
+    if [ -n "$PYTHON_BIN" ]; then
+      "$PYTHON_BIN" -I -S "$JSON_HELPER" "$SHELL_CONFIG" "$PLUGIN_ID" remove
+    else
+      echo "   [!] No trusted python3 found; leaving the shell.json widget entry in place."
+    fi
     rm -f "$JSON_HELPER"
     trap - EXIT
   else

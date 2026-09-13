@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lu15ggtz.netscan",
   "name": "Network Scanner",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "Luis Adolfo Guevara Gutierrez (lu15ggtz)",
   "description": "Fast local network discovery via arp-scan with on-demand nmap service inspection for Omarchy",
   "homepage": "https://github.com/LuisGuevaraGtz/omarchy-netscan",

@@ -3,11 +3,13 @@ Description=Omarchy netscan snapshot
 
 [Service]
 Type=oneshot
-# @ENGINE@ is substituted by install.sh with the resolved plugin path
-# (bin/netscan-engine inside ~/.config/omarchy/plugins/lu15ggtz.netscan).
-# install.sh writes this file to ~/.config/systemd/user/ with the real path.
-ExecStart=@ENGINE@ snapshot
+# @PYTHON@ and @ENGINE@ are substituted by install.sh: the verified absolute
+# interpreter and the resolved engine path inside the installed plugin dir.
+# install.sh writes this file to ~/.config/systemd/user/ with real paths.
+ExecStart=@PYTHON@ -I -S @ENGINE@ snapshot
 PrivateTmp=yes
+Environment=LC_ALL=C PATH=/usr/bin:/usr/sbin:/bin:/sbin
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH
 
 # Deliberately NOT setting NoNewPrivileges=yes: it would block file
 # capabilities from taking effect, and arp-scan needs its cap_net_raw+p

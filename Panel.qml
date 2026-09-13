@@ -17,6 +17,38 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string enginePath: Qt.resolvedUrl("bin/netscan-engine").toString().replace(/^file:\/\//, "")
 
+  // Fixed interpreter for every engine launch: absolute path plus
+  // isolated mode (-I: ignore PYTHONPATH/PYTHONHOME/user site) and no
+  // site processing (-S: skip sitecustomize/usercustomize/.pth). The
+  // engine only needs the standard library. /usr/bin/python3 is
+  // distro-managed on Arch/Debian/Fedora; non-FHS systems need that
+  // path to exist -- determinism is the point, PATH flexibility for
+  // the interpreter itself is intentionally gone.
+  readonly property string pythonBin: "/usr/bin/python3"
+
+  // Clean-room environment for engine launches, used together with
+  // clearEnvironment on every Process below so NOTHING else is
+  // inherited -- no PYTHON*, no LD_PRELOAD/LD_LIBRARY_PATH. Only the
+  // values the engine and its helpers need are passed back in:
+  // state-dir lookup, Wayland clipboard, session-bus notifications,
+  // and deterministic (C-locale, trusted-dir) defaults. Missing
+  // values are omitted, never passed as empty/"undefined" strings.
+  function buildCleanEnv() {
+    var e = {
+      "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+      "LC_ALL": "C"
+    }
+    var passthrough = ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+                       "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY",
+                       "DBUS_SESSION_BUS_ADDRESS"]
+    for (var i = 0; i < passthrough.length; ++i) {
+      var v = Quickshell.env(passthrough[i])
+      if (v !== undefined && v !== "") e[passthrough[i]] = v
+    }
+    return e
+  }
+  readonly property var cleanEnv: buildCleanEnv()
+
   // User-tunable from the widget's shell.json entry (manifest
   // barWidget.defaults/schema). Clamped so a hand-edited value can't
   // produce a degenerate panel.
@@ -85,7 +117,7 @@ Panel {
     selectedIp = ip
     deepScanDone = false
     deviceIdentity = null
-    nmapProc.command = [enginePath, "ports", ip]
+    nmapProc.command = [root.pythonBin, "-I", "-S", root.enginePath, "ports", ip]
     nmapProc.running = true
   }
 
@@ -120,7 +152,7 @@ Panel {
     root.deviceIdentity = null
     root.currentPorts = []
     root.deepBuffer = ""
-    deepProc.command = [root.enginePath, "inspect", ip]
+    deepProc.command = [root.pythonBin, "-I", "-S", root.enginePath, "inspect", ip]
     deepProc.running = true
   }
 
@@ -186,8 +218,8 @@ Panel {
     root.aliasTargetName = trimmed
     root.aliasBuffer = ""
     aliasProc.command = trimmed.length > 0
-      ? [root.enginePath, "alias", "set", mac, trimmed]
-      : [root.enginePath, "alias", "rm", mac]
+      ? [root.pythonBin, "-I", "-S", root.enginePath, "alias", "set", mac, trimmed]
+      : [root.pythonBin, "-I", "-S", root.enginePath, "alias", "rm", mac]
     aliasProc.running = true
   }
 
@@ -215,7 +247,9 @@ Panel {
 
   Process {
     id: scanProc
-    command: [root.enginePath, "scan"]
+    clearEnvironment: true
+    environment: root.cleanEnv
+    command: [root.pythonBin, "-I", "-S", root.enginePath, "scan"]
     stdout: SplitParser {
       onRead: function(data) {
         root.scanBuffer += data
@@ -245,7 +279,9 @@ Panel {
 
   Process {
     id: nmapProc
-    command: [root.enginePath, "ports", root.selectedIp]
+    clearEnvironment: true
+    environment: root.cleanEnv
+    command: [root.pythonBin, "-I", "-S", root.enginePath, "ports", root.selectedIp]
     stdout: SplitParser {
       onRead: function(data) {
         root.nmapBuffer += data
@@ -272,6 +308,8 @@ Panel {
 
   Process {
     id: aliasProc
+    clearEnvironment: true
+    environment: root.cleanEnv
     stdout: SplitParser {
       onRead: function(data) {
         root.aliasBuffer += data
@@ -305,13 +343,15 @@ Panel {
       var ip = root.selectedIp
       if (!ip || root.hostnameCache.hasOwnProperty(ip) || identifyProc.running) return
       root.identifyBuffer = ""
-      identifyProc.command = [root.enginePath, "identify", ip]
+      identifyProc.command = [root.pythonBin, "-I", "-S", root.enginePath, "identify", ip]
       identifyProc.running = true
     }
   }
 
   Process {
     id: identifyProc
+    clearEnvironment: true
+    environment: root.cleanEnv
     stdout: SplitParser {
       onRead: function(data) {
         root.identifyBuffer += data
@@ -336,6 +376,8 @@ Panel {
 
   Process {
     id: deepProc
+    clearEnvironment: true
+    environment: root.cleanEnv
     stdout: SplitParser {
       onRead: function(data) {
         root.deepBuffer += data
@@ -370,14 +412,23 @@ Panel {
     }
   }
 
+  // Clipboard and browser actions are mediated by the engine (`copy`
+  // validates a strict IPv4 literal, `open` only allows http(s) URLs
+  // with a literal IPv4 host), so QML never execs a bare helper name.
+  // wl-copy/xdg-open themselves are bound to trusted absolute paths
+  // inside the engine.
   Process {
     id: copyProc
-    command: ["wl-copy", root.copyTarget]
+    clearEnvironment: true
+    environment: root.cleanEnv
+    command: [root.pythonBin, "-I", "-S", root.enginePath, "copy", root.copyTarget]
   }
 
   Process {
     id: browserProc
-    command: ["xdg-open", root.openUrl]
+    clearEnvironment: true
+    environment: root.cleanEnv
+    command: [root.pythonBin, "-I", "-S", root.enginePath, "open", root.openUrl]
   }
 
   Timer {

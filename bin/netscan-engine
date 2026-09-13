@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -IS
 import sys
 import subprocess
 import json
 import re
-import shutil
 import os
 import stat
 import signal
@@ -50,6 +49,134 @@ _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _IFACE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 _IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+_OPEN_URL_RE = re.compile(r"^https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:/.*)?$")
+
+# ------------------------------------------------------------------------
+# Execution trust: deterministic interpreter, sanitized environment, and
+# trusted helper paths.
+#
+# The engine is always launched as an absolute interpreter plus flags
+# (see the shebang, the QML `pythonBin`, the generated CLI wrapper, and
+# the generated systemd unit): /usr/bin/python3 -IS <this file> ...
+#  - absolute interpreter: no PATH lookup for python3 itself;
+#  - -I (isolated): ignore PYTHONPATH/PYTHONHOME and the user site;
+#  - -S (no site): skip sitecustomize/usercustomize/.pth processing.
+# Only the standard library is imported, so nothing here needs
+# site-packages. /usr/bin/python3 is distro-managed on Arch, Debian,
+# Fedora (and their derivatives); non-FHS systems need that path to
+# exist -- determinism is the point, PATH flexibility is what's being
+# removed.
+#
+# _sanitize_env() is defense in depth for launch paths that reach the
+# engine without a scrubbed environment (direct ./netscan-engine runs,
+# hand-rolled invocations): it drops every interpreter/startup variable
+# Python honors after startup, pins a safe default PATH only when none
+# is set, and pins LC_ALL=C so nmap's English text output parses
+# deterministically regardless of the login locale. It deliberately does
+# NOT claim to neutralize LD_PRELOAD/LD_LIBRARY_PATH -- the dynamic
+# loader acts before Python starts, so those are scrubbed by the
+# launchers (QML clearEnvironment, CLI wrapper env -i, systemd
+# UnsetEnvironment), never from inside the process.
+#
+# _trusted_bin() binds every security-sensitive helper (ip, arp-scan,
+# nmap, notify-send, getent, avahi-resolve-address, wl-copy, xdg-open)
+# to an absolute path in a distro-managed directory, verified to be a
+# root-owned regular file with no group/other write bit. Anything that
+# only exists outside the trusted directories (/usr/local/bin,
+# ~/.local/bin, a venv, ...) resolves as "not found" and the engine
+# degrades gracefully (neighbor-table fallback, "nmap binary not found",
+# silent no-notify) -- exactly as it already does when a tool is absent.
+# ------------------------------------------------------------------------
+_TRUSTED_BIN_DIRS = ("/usr/bin", "/usr/sbin", "/bin", "/sbin")
+_TRUSTED_PATH = ":".join(_TRUSTED_BIN_DIRS)
+
+# Interpreter/startup variables Python honors after startup. Denylist
+# (not allowlist): anything not listed here passes through untouched.
+_UNSAFE_ENV_VARS = frozenset({
+    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONPLUGINS",
+    "PYTHONCASEOK", "PYTHONDEBUG", "PYTHONVERBOSE", "PYTHONINSPECT",
+    "PYTHONNOUSERSITE", "PYTHONSAFEPATH", "PYTHONWARNINGS",
+    "PYTHONBREAKPOINT", "PYTHONDEVMODE", "PYTHONMALLOC",
+    "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONDONTWRITEBYTECODE",
+    "PYTHONUNBUFFERED", "PYTHONCOERCECLOCALE",
+    "__PYVENV_LAUNCHER__",
+})
+
+_trusted_bin_cache = {}
+
+
+def _sanitize_env():
+    """Scrub interpreter/startup variables and pin deterministic defaults.
+
+    Safe to call on every startup: it only removes denylisted variables
+    and fills in PATH/LC_ALL when missing-or-empty (LC_ALL is always
+    pinned -- nothing in this engine is locale-sensitive, while nmap's
+    text output parsing is locale-fragile).
+    """
+    env = os.environ
+    for var in _UNSAFE_ENV_VARS:
+        env.pop(var, None)
+    if not env.get("PATH"):
+        env["PATH"] = _TRUSTED_PATH
+    env["LC_ALL"] = "C"
+
+
+def _is_trusted_exec(path):
+    """True if `path` is a root-owned, non-group/world-writable regular
+    file inside a distro-managed bin directory.
+
+    Symlinks are followed, then the *resolved* location must still be
+    inside the trusted set -- a symlink planted in /usr/bin pointing at
+    /tmp (or anywhere else untrusted) is rejected.
+    """
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
+    try:
+        parent = os.path.realpath(os.path.dirname(resolved))
+    except OSError:
+        return False
+    trusted_parents = set()
+    for d in _TRUSTED_BIN_DIRS:
+        try:
+            trusted_parents.add(os.path.realpath(d))
+        except OSError:
+            continue
+    if parent not in trusted_parents:
+        return False
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_uid != 0:
+        return False
+    if st.st_mode & 0o022:
+        return False
+    return os.access(resolved, os.X_OK)
+
+
+def _trusted_bin(name):
+    """Absolute path of helper `name` in a trusted directory, or None.
+
+    `name` must be a bare filename (no slashes); results are cached per
+    process. Helpers found only outside the trusted directories resolve
+    as missing -- callers degrade gracefully in that case.
+    """
+    if not name or "/" in name:
+        return None
+    if name in _trusted_bin_cache:
+        return _trusted_bin_cache[name]
+    found = None
+    for d in _TRUSTED_BIN_DIRS:
+        candidate = os.path.join(d, name)
+        if _is_trusted_exec(candidate):
+            found = os.path.realpath(candidate)
+            break
+    _trusted_bin_cache[name] = found
+    return found
 
 
 def normalize_mac(s):
@@ -323,8 +450,11 @@ def get_network_details():
     local_ip = ""
 
     try:
-        raw, _, _ = run_bounded(["ip", "route"], timeout=2, max_bytes=64 * 1024)
-        route_out = raw.decode("utf-8", "replace")
+        route_out = ""
+        ip_bin = _trusted_bin("ip")
+        if ip_bin:
+            raw, _, _ = run_bounded([ip_bin, "route"], timeout=2, max_bytes=64 * 1024)
+            route_out = raw.decode("utf-8", "replace")
         for line in route_out.splitlines():
             if line.startswith("default"):
                 parts = line.split()
@@ -394,7 +524,7 @@ def _discover_devices():
         devices_dict[key] = entry
 
     # 1. Try arp-scan first (fastest and gives MAC vendor)
-    arp_scan_bin = shutil.which("arp-scan")
+    arp_scan_bin = _trusted_bin("arp-scan")
     if arp_scan_bin:
         try:
             cmd = [arp_scan_bin, "--localnet"]
@@ -453,8 +583,11 @@ def _discover_devices():
     # rather not spawn a conflicting-MAC duplicate for an IP arp-scan already
     # resolved.
     try:
-        raw, _, _ = run_bounded(["ip", "-4", "neigh", "show"], timeout=2, max_bytes=256 * 1024)
-        neigh_out = raw.decode("utf-8", "replace")
+        neigh_out = ""
+        ip_bin = _trusted_bin("ip")
+        if ip_bin:
+            raw, _, _ = run_bounded([ip_bin, "-4", "neigh", "show"], timeout=2, max_bytes=256 * 1024)
+            neigh_out = raw.decode("utf-8", "replace")
         seen_ips = set()
         for d in devices_dict.values():
             seen_ips.add(d["ip"])
@@ -615,7 +748,7 @@ def _notify_new_devices(new_devices):
     """
     if not new_devices:
         return
-    notify_bin = shutil.which("notify-send")
+    notify_bin = _trusted_bin("notify-send")
     if not notify_bin:
         return
 
@@ -724,7 +857,7 @@ def scan_ports(target_ip):
         print(json.dumps({"status": "error", "message": "Invalid target IP"}))
         return
 
-    nmap_bin = shutil.which("nmap")
+    nmap_bin = _trusted_bin("nmap")
     if not nmap_bin:
         print(json.dumps({"status": "error", "message": "nmap binary not found"}))
         return
@@ -837,7 +970,7 @@ def inspect_host(ip):
         emit_json({"status": "error", "message": "Invalid target IP"})
         return
 
-    nmap_bin = shutil.which("nmap")
+    nmap_bin = _trusted_bin("nmap")
     if not nmap_bin:
         emit_json({"status": "error", "message": "nmap binary not found"})
         return
@@ -1010,7 +1143,7 @@ def identify_host(ip):
     hostname = ""
     source = ""
 
-    getent_bin = shutil.which("getent")
+    getent_bin = _trusted_bin("getent")
     if getent_bin:
         try:
             raw, _, _ = run_bounded([getent_bin, "hosts", ip], timeout=2, max_bytes=8 * 1024)
@@ -1025,7 +1158,7 @@ def identify_host(ip):
             pass
 
     if not hostname:
-        avahi_bin = shutil.which("avahi-resolve-address")
+        avahi_bin = _trusted_bin("avahi-resolve-address")
         if avahi_bin:
             try:
                 raw, _, _ = run_bounded([avahi_bin, ip], timeout=2, max_bytes=8 * 1024)
@@ -1040,6 +1173,58 @@ def identify_host(ip):
                 pass
 
     emit_json({"status": "ok", "ip": ip, "hostname": hostname, "source": source})
+
+
+def cmd_copy(args):
+    """Copy a validated IPv4 address to the Wayland clipboard via the
+    trusted wl-copy binary.
+
+    The text travels as an argv element (never a shell), and only a
+    strict IPv4 literal is accepted -- an argument that can't start with
+    "-" can't be smuggled into a flag, and "--" ends option parsing
+    anyway. The panel routes its Copy-IP button through here so QML
+    never execs a bare helper name.
+    """
+    target = args[0] if args else ""
+    if not target or not _IP_RE.match(target):
+        emit_json({"status": "error", "message": "Invalid copy target"})
+        return
+    wl_bin = _trusted_bin("wl-copy")
+    if not wl_bin:
+        emit_json({"status": "error", "message": "wl-copy binary not found"})
+        return
+    _, truncated, timed_out = run_bounded([wl_bin, "--", target], timeout=5, max_bytes=64 * 1024)
+    if timed_out or truncated:
+        emit_json({"status": "error", "message": "Clipboard copy timed out"})
+        return
+    emit_json({"status": "ok", "copied": target})
+
+
+def cmd_open(args):
+    """Open a validated device URL in the browser via trusted xdg-open.
+
+    Only http(s) URLs with a literal IPv4 host are accepted -- the panel
+    only ever builds those (http(s)://<selectedIp>[:port] for ports
+    80/8080/443). Anything else, notably file:, javascript:, data:, or
+    hostname-based URLs, is refused. No "--" separator is passed because
+    xdg-open treats a bare "--" as the URL itself; the regex already
+    guarantees the argument starts with "http" so flag smuggling is
+    impossible. Bounded like every other helper (10s, then the process
+    group is reaped).
+    """
+    url = args[0] if args else ""
+    if not url or len(url) > 256 or not _OPEN_URL_RE.match(url):
+        emit_json({"status": "error", "message": "Invalid URL"})
+        return
+    xdg_bin = _trusted_bin("xdg-open")
+    if not xdg_bin:
+        emit_json({"status": "error", "message": "xdg-open binary not found"})
+        return
+    _, truncated, timed_out = run_bounded([xdg_bin, url], timeout=10, max_bytes=64 * 1024)
+    if timed_out or truncated:
+        emit_json({"status": "error", "message": "Browser launch timed out"})
+        return
+    emit_json({"status": "ok", "opened": url})
 
 
 def cmd_alias(args):
@@ -1100,6 +1285,7 @@ def cmd_alias(args):
 
 
 if __name__ == "__main__":
+    _sanitize_env()
     if len(sys.argv) < 2 or sys.argv[1] == "scan":
         scan_network()
     elif sys.argv[1] == "ports":
@@ -1115,5 +1301,9 @@ if __name__ == "__main__":
         inspect_host(target)
     elif sys.argv[1] == "snapshot":
         snapshot()
+    elif sys.argv[1] == "copy":
+        cmd_copy(sys.argv[2:])
+    elif sys.argv[1] == "open":
+        cmd_open(sys.argv[2:])
     else:
         print(json.dumps({"status": "error", "message": "Unknown command"}))

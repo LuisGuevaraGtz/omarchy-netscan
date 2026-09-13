@@ -37,7 +37,10 @@ The Network Scanner widget lives right on your Omarchy top bar and opens a nativ
 
 The plugin relies on standard, unprivileged network utilities:
 
-- **`python3`** — required: the scanning engine is a Python 3 script.
+- **`python3`** — required: the scanning engine is a Python 3 script, always
+  launched as `/usr/bin/python3 -IS` (absolute distro-managed path, isolated
+  mode, no site processing — see Security notes). `install.sh` verifies that
+  path before baking it into the CLI wrapper and systemd unit.
 - **`arp-scan`** — recommended: fast raw-packet discovery with vendor OUI.
   Without it the panel falls back to the kernel neighbor table (fewer
   devices, no vendor names).
@@ -267,6 +270,39 @@ where the names you've typed in live.
 
 ## 🔒 Security notes
 
+- **Deterministic interpreter.** The engine is always started as
+  `/usr/bin/python3 -IS <engine> …` — an absolute interpreter path (no
+  `PATH` lookup for `python3` itself), isolated mode (`-I`: ignore
+  `PYTHONPATH`/`PYTHONHOME`/user site) and no site processing (`-S`:
+  skip `sitecustomize`/`usercustomize`/`.pth` files). This holds on all
+  four launch paths: the QML panel (`pythonBin`), direct execution
+  (shebang), the generated CLI wrapper, and the generated systemd unit.
+  The engine only needs the standard library. `/usr/bin/python3` is
+  distro-managed on Arch/Debian/Fedora; non-FHS systems need that path
+  to exist.
+- **Sanitized environment.** Every QML launch uses `clearEnvironment`
+  with an explicit allowlist (`PATH`, `LC_ALL=C`, `HOME`, `XDG_*`,
+  `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`) — no `PYTHON*`, no
+  `LD_PRELOAD`/`LD_LIBRARY_PATH`. The CLI wrapper runs the engine under
+  `env -i` with the same allowlist; the systemd unit declares
+  `Environment=` + `UnsetEnvironment=`; and the engine itself drops all
+  `PYTHON*` startup variables on startup as defense in depth. `LC_ALL=C`
+  additionally makes nmap's English text output parse deterministically
+  under any login locale.
+- **Trusted helper paths.** `ip`, `arp-scan`, `nmap`, `notify-send`,
+  `getent`, `avahi-resolve-address`, `wl-copy`, and `xdg-open` are never
+  resolved via `PATH`. Each must be a root-owned, non-group/world-
+  writable regular file inside `/usr/bin`, `/usr/sbin`, `/bin`, or
+  `/sbin` (symlinks are followed and the *resolved* location must still
+  be inside that set). Anything living only in `/usr/local/bin`,
+  `~/.local/bin`, or a venv resolves as "not found", and the engine
+  degrades gracefully exactly as when a tool is absent.
+- **Clipboard and browser go through the engine.** QML never execs a
+  bare helper: Copy-IP runs `engine copy <ip>` (strict IPv4 literal
+  only, passed as argv after `--`) and Open-in-browser runs
+  `engine open <url>` (only `http(s)://<IPv4>[:port]` accepted —
+  `file:`, `javascript:`, `data:`, and hostname URLs are refused).
+  Both helpers stay bounded by the same timeout/killpg machinery.
 - **Bounded scanning.** `ip`, `arp-scan`, and `nmap` are run in their own
   process group with their stdout capped at a fixed size instead of buffered
   without limit. If a host on the network floods a scan with an oversized

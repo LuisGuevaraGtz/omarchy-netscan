@@ -39,6 +39,22 @@ if ! command -v python3 &>/dev/null; then
   exit 1
 fi
 
+# Resolve the deterministic interpreter baked into the CLI wrapper and the
+# systemd unit: an absolute, symlink-free path in a distro-managed bin
+# directory, pointing at a root-owned, non-group/other-writable, executable
+# regular file. This is the same trust bar the engine itself applies to its
+# helpers at runtime (see _trusted_bin in bin/netscan-engine) -- the engine
+# must never be started through a PATH-resolved `python3`.
+PYTHON_BIN="$(realpath "$(command -v python3)")"
+case "$PYTHON_BIN" in
+  /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*) ;;
+  *) echo "[!] python3 resolves to '$PYTHON_BIN', outside the distro-managed bin directories."; exit 1;;
+esac
+if [ ! -f "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ] || [ -n "$(find "$PYTHON_BIN" -maxdepth 0 \( -not -uid 0 -or -perm /022 \))" ]; then
+  echo "[!] python3 at '$PYTHON_BIN' is not a root-owned, non-group/other-writable executable file."
+  exit 1
+fi
+
 MISSING_DEPS=()
 for dep in arp-scan nmap; do
   if ! command -v "$dep" &>/dev/null; then
@@ -172,12 +188,36 @@ chmod +x "$PLUGIN_DIR/bin/netscan-engine"
 
 # 4. Install CLI trigger wrapper. Generated from the resolved plugin path so
 #    it keeps working when $XDG_CONFIG_HOME points somewhere non-standard.
-#    @PLUGIN_ID@ / @ENGINE@ are substituted below; every other '$' is written
-#    literally for the wrapper's own runtime use.
+#    @PLUGIN_ID@ / @ENGINE@ / @PYTHON@ are substituted below; every other '$'
+#    is written literally for the wrapper's own runtime use.
 cat << 'WRAPPER_EOF' > "$CLI_DIR/omarchy-netscan"
 #!/usr/bin/env bash
 PLUGIN_ID="@PLUGIN_ID@"
 ENGINE="@ENGINE@"
+PYTHON="@PYTHON@"
+
+# Run the engine with a deterministic interpreter (/usr/bin/python3 -IS:
+# absolute path, isolated mode, no site processing) and a scrubbed
+# environment. env -i drops everything the caller's shell exported --
+# PYTHON*, LD_PRELOAD/LD_LIBRARY_PATH included -- then only the values
+# the engine and its helpers need are passed back in. Empty values fall
+# back to the engine's own defaults (e.g. ~/.config when XDG_* is empty).
+_engine() {
+  env -i \
+    "HOME=$HOME" \
+    "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-}" \
+    "XDG_STATE_HOME=${XDG_STATE_HOME:-}" \
+    "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}" \
+    "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" \
+    "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}" \
+    "PATH=/usr/bin:/usr/sbin:/bin:/sbin" \
+    "LC_ALL=C" \
+    "$PYTHON" -I -S "$ENGINE" "$@"
+}
+
+_json() {
+  "$PYTHON" -I -S -m json.tool
+}
 
 if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
   echo "Omarchy Network Scanner"
@@ -197,7 +237,7 @@ if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
 fi
 
 if [ "$1" == "--cli" ]; then
-  python3 "$ENGINE" scan | python3 -m json.tool
+  _engine scan | _json
   exit 0
 fi
 
@@ -206,7 +246,7 @@ if [ "$1" == "--ports" ]; then
     echo "Error: Please specify target IP (e.g. omarchy-netscan --ports 192.168.100.1)"
     exit 1
   fi
-  python3 "$ENGINE" ports "$2" | python3 -m json.tool
+  _engine ports "$2" | _json
   exit 0
 fi
 
@@ -238,10 +278,10 @@ fi
 if command -v omarchy-shell &>/dev/null; then
   omarchy-shell shell toggle "$PLUGIN_ID"
 else
-  python3 "$ENGINE" scan | python3 -m json.tool
+  _engine scan | _json
 fi
 WRAPPER_EOF
-sed -i -e "s|@PLUGIN_ID@|$PLUGIN_ID|g" -e "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|g" "$CLI_DIR/omarchy-netscan"
+sed -i -e "s|@PLUGIN_ID@|$PLUGIN_ID|g" -e "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|g" -e "s|@PYTHON@|$PYTHON_BIN|g" "$CLI_DIR/omarchy-netscan"
 chmod +x "$CLI_DIR/omarchy-netscan"
 
 # 5. Install the (opt-in) systemd --user units for periodic snapshots /
@@ -259,8 +299,15 @@ Description=Omarchy netscan snapshot
 
 [Service]
 Type=oneshot
-ExecStart=@ENGINE@ snapshot
+ExecStart=@PYTHON@ -I -S @ENGINE@ snapshot
 PrivateTmp=yes
+# Deterministic locale and helper lookup for the run.
+Environment=LC_ALL=C PATH=/usr/bin:/usr/sbin:/bin:/sbin
+# The engine is launched as an absolute interpreter with -IS (isolated, no
+# site processing) and binds every helper to a verified absolute path, but
+# belt and suspenders: drop interpreter/startup and loader-injection
+# variables from the unit's environment as well.
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH
 
 # Deliberately NOT setting NoNewPrivileges=yes: it would block file
 # capabilities from taking effect, and arp-scan needs its cap_net_raw+p
@@ -273,7 +320,7 @@ PrivateTmp=yes
 # no real security margin here, it would just silently turn the scan into
 # an empty result every time the timer fires.
 SERVICE_EOF
-sed -i "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|" "$SYSTEMD_USER_DIR/omarchy-netscan.service"
+sed -i -e "s|@ENGINE@|$PLUGIN_DIR/bin/netscan-engine|" -e "s|@PYTHON@|$PYTHON_BIN|" "$SYSTEMD_USER_DIR/omarchy-netscan.service"
 
 cat << 'TIMER_EOF' > "$SYSTEMD_USER_DIR/omarchy-netscan.timer"
 [Unit]
